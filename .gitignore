@@ -1,0 +1,14 @@
+# Per-developer config — contains your local SSH key path; never commit.
+config.json
+
+# Secrets — the SSH private key must never end up in the repo/bundle.
+*.pem
+*.key
+*.ppk
+
+# Runtime log (JSONL trace of every tool call).
+srcds_mcp.log
+
+# Python bytecode cache.
+__pycache__/
+*.pyc

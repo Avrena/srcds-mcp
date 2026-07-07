@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy this file to config.json and fill in ssh.key + ssh.host + public_ip. config.json is git-ignored and must NEVER be committed. The SSH private key itself is NOT in this repo - get it, and the node address, from your team lead. Everything else has sane defaults for a standard Pterodactyl node.",
+
+  "ssh": {
+    "bin": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+    "key": "C:/path/to/your/ssh_key.pem",
+    "known_hosts": "",
+    "host": "root@YOUR_NODE_IP",
+    "port": "22"
+  },
+
+  "public_ip": "YOUR_NODE_IP",
+
+  "volroot": "/var/lib/pterodactyl/volumes",
+  "backups_root": "/var/lib/pterodactyl/srcds_mcp_backups",
+
+  "wings": {
+    "api": "http://127.0.0.1:8081",
+    "config": "/etc/pterodactyl/config.yml"
+  },
+  "owner_uid": 999,
+  "owner_gid": 987,
+
+  "panel_url": "https://your-panel.example.com",
+
+  "live_thresholds": { "scprp": 50, "drp": 20, "zcity": 3 },
+
+  "servers": [
+    { "logical": "scprp", "marker": "addons/your-scp-addon" },
+    { "logical": "zcity", "marker": "addons/your-city-addon" },
+    { "logical": "drp",   "marker": "gamemodes/darkrp" }
+  ],
+
+  "db_aliases": { "scprp": "your_scprp_schema", "drp": "your_drp_schema" }
+}

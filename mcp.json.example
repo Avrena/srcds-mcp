@@ -1,0 +1,12 @@
+{
+  "//": "Register srcds as an MCP server. For Claude Code, merge this 'mcpServers' block into the project's .mcp.json (or ~/.claude.json). Use FULL absolute paths to python and to srcds_mcp.py, and adjust them to where YOU unzipped this bundle. MCP servers load at client startup -- restart Claude Code after editing.",
+  "mcpServers": {
+    "srcds": {
+      "command": "C:\\Users\\YOU\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+      "args": ["C:\\Users\\YOU\\tools\\srcds-mcp\\srcds_mcp.py"]
+    }
+  },
+
+  "// codex": "For Codex CLI instead of Claude Code, this goes in ~/.codex/config.toml as:",
+  "// codex_toml": "[mcp_servers.srcds]\ncommand = 'C:\\\\Users\\\\YOU\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python310\\\\python.exe'\nargs = ['C:\\\\Users\\\\YOU\\\\tools\\\\srcds-mcp\\\\srcds_mcp.py']"
+}
