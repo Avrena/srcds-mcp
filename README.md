@@ -196,19 +196,22 @@ don't hit the Windows ~32 KB command-line limit**.
 | Tool | Gate | What |
 | --- | --- | --- |
 | `srcds_status` | always allowed | up/down, **live player count (A2S)**, LIVE flag vs thresholds, port, condebug |
-| `srcds_fetch` | always allowed | tail `console.log` or read any file under `garrysmod/`; ANSI stripped, output byte-capped (`maxbytes`, default 48 KB) |
+| `srcds_fetch` | always allowed | tail `console.log`, read a file (or `save_to` = binary-safe download), list a dir, `sha1` a subtree, or list deploy backups; ANSI stripped, byte-capped |
 | `srcds_console` | confirm if destructive | inject a console command; returns the console.log delta where `-condebug` is on (ANSI-stripped, byte-capped like fetch) |
 | `srcds_lua` | confirm if mutating | run server Lua / **multi-line verification suites**; captures output + `return <expr>` with an assertion harness |
-| `srcds_deploy` | confirm | write a local file / inline content to the volume; UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `.lua` hot-reloads, works even if server DOWN |
+| `srcds_deploy` | confirm | write a local file / inline content to the volume; UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `restore:true` rolls back to the last backup, `.lua` hot-reloads, works even if server DOWN |
 | `srcds_grep` | always allowed | recursive `grep` across the **deployed** volume source (find symbols / local-vs-remote divergence) |
+| `srcds_diff` | always allowed | unified diff of a deployed file vs another server's copy or vs a **local** file — divergence checks before deploying |
+| `srcds_nodeinfo` | always allowed | host health: load, memory, disk, docker stats; optional wings-log / dmesg tails for crash & OOM forensics |
 | `srcds_clientlua` | confirm | run **clientside** Lua on connected players (chunked base64 `SendLua`); UI/PAC3 hot-reload without reconnect |
 | `srcds_power` | confirm (+force if LIVE) | wings-API start/stop/restart/kill (graceful, not a crash); `action:"watch"` awaits boot completion |
 | `srcds_db_query` | read auto / write confirm | SQL against the game MariaDB; SELECT/SHOW auto, INSERT/UPDATE/DELETE/DDL need confirm |
 | `srcds_db_schema` | always allowed | browse databases → tables (row counts) → columns/indexes |
 
-Dev loop: **`srcds_grep`** (find) → edit locally → **`srcds_deploy`** (push,
-autorefresh reloads) → **`srcds_lua`** suite (verify) → **`srcds_clientlua`** (push
-clientside) → **`srcds_power`** (boot a server that's off).
+Dev loop: **`srcds_grep`** (find) → **`srcds_diff`** (check divergence) → edit
+locally → **`srcds_deploy`** (push, autorefresh reloads) → **`srcds_lua`** suite
+(verify) → **`srcds_clientlua`** (push clientside) → **`srcds_power`** (boot a
+server that's off) — and `srcds_deploy {restore:true}` if the push went wrong.
 
 ### Examples
 - `srcds_status` → table of all servers.

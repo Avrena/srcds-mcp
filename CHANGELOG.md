@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.0 — Divergence tooling, rollback, downloads, node health
+Two new tools and two extended ones, aimed at the workflows around the core dev
+loop: comparing deployments, undoing a bad push, and crash forensics.
+
+- **`srcds_diff` (new).** Unified diff of a deployed file against another
+  server's copy (same or different path) or against a local file. Reports
+  IDENTICAL / DIFFER (+diff, 40 KB cap) / binary mismatch with sizes and sha1s.
+- **`srcds_nodeinfo` (new).** Read-only host health: loadavg, memory/swap,
+  uptime, disk usage, per-container `docker stats`, plus optional wings-log and
+  `dmesg` tails (crash-detection lines and OOM-killer traces).
+- **`srcds_fetch` modes.** `what:"dir"` (listing with sizes/mtimes),
+  `what:"hash"` (recursive sha1 of a subtree — compare two servers' listings,
+  then `srcds_diff` the files that differ), `what:"backups"` (list deploy
+  backups), and `save_to` (binary-safe download of e.g. crash dumps — bytes go
+  straight to a local file, never into the conversation; 8 MB cap,
+  `overwrite:true` to replace).
+- **`srcds_deploy restore:true`.** Rolls a path back to its last out-of-tree
+  deploy backup. The backup is deliberately kept (not overwritten by the bad
+  file), so restore stays repeatable.
+- 12 tools total.
+
 ## 1.2.0 — Boot watcher, token-lean output, config-derived descriptions
 Output-size hardening for LLM clients, boot-completion notification, and the
 last de-branding pass.

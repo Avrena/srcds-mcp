@@ -12,8 +12,8 @@ No third-party packages. Stdlib only. Speaks MCP over newline-delimited JSON-RPC
 on stdin/stdout.
 
 Tools: srcds_status, srcds_fetch, srcds_console, srcds_lua, srcds_deploy,
-srcds_grep, srcds_clientlua, srcds_power, srcds_db_query, srcds_db_schema.
-Server names come from config.json (`servers[]`).
+srcds_grep, srcds_diff, srcds_nodeinfo, srcds_clientlua, srcds_power,
+srcds_db_query, srcds_db_schema. Server names come from config.json (`servers[]`).
 
 Safety: reads are always allowed; writes that look destructive/mutating require
 confirm=true. Every call is logged to srcds_mcp.log next to this file.
@@ -448,6 +448,91 @@ def op_lua(req):
 def op_fetch(req):
     u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
     what = req.get("what", "console"); lines = int(req.get("lines", 200))
+
+    if what == "dir":
+        base = _safe_under(gm, req.get("path", ""))
+        if not base:
+            return {"ok": False, "error": "path escapes volume"}
+        if not os.path.isdir(base):
+            return {"ok": False, "error": "no such directory: %s" % req.get("path", "")}
+        try:
+            names = sorted(os.listdir(base))
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        ents = []
+        for n in names[:500]:
+            fp = os.path.join(base, n)
+            try:
+                st = os.stat(fp)
+                ents.append({"name": n, "dir": os.path.isdir(fp),
+                             "size": st.st_size, "mtime": int(st.st_mtime)})
+            except OSError:
+                ents.append({"name": n, "dir": False, "size": None, "mtime": None})
+        return {"ok": True, "entries": ents, "total": len(names),
+                "truncated": len(names) > 500}
+
+    if what == "hash":
+        import hashlib, fnmatch
+        base = _safe_under(gm, req.get("path", ""))
+        if not base:
+            return {"ok": False, "error": "path escapes volume"}
+        glob = req.get("glob") or "*"
+        def sha1_of(fp):
+            h = hashlib.sha1()
+            with open(fp, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()[:12]
+        files = {}
+        if os.path.isfile(base):
+            try:
+                files[os.path.basename(base)] = [sha1_of(base), os.path.getsize(base)]
+            except OSError as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "files": files, "count": 1, "truncated": False}
+        if not os.path.isdir(base):
+            return {"ok": False, "error": "no such path: %s" % req.get("path", "")}
+        n = 0; capped = False
+        for root, dirs, fnames in os.walk(base):
+            dirs.sort()
+            for fn in sorted(fnames):
+                if not fnmatch.fnmatch(fn, glob):
+                    continue
+                n += 1
+                if n > 2000:
+                    capped = True
+                    break
+                fp = os.path.join(root, fn)
+                rel = fp[len(base):].lstrip("/")
+                try:
+                    files[rel] = [sha1_of(fp), os.path.getsize(fp)]
+                except OSError:
+                    files[rel] = [None, None]
+            if capped:
+                break
+        return {"ok": True, "files": files, "count": len(files), "truncated": capped}
+
+    if what == "backups":
+        broot = BAKROOT + "/" + u
+        out = []
+        capped = False
+        for root, dirs, fnames in os.walk(broot):
+            dirs.sort()
+            for fn in sorted(fnames):
+                fp = os.path.join(root, fn)
+                rel = fp[len(broot):].lstrip("/")
+                try:
+                    st = os.stat(fp)
+                    out.append({"path": rel, "size": st.st_size, "mtime": int(st.st_mtime)})
+                except OSError:
+                    pass
+                if len(out) >= 500:
+                    capped = True
+                    break
+            if capped:
+                break
+        return {"ok": True, "backups": out, "truncated": capped}
+
     if what == "console":
         p = gm + "/console.log"
     elif what == "file":
@@ -459,6 +544,20 @@ def op_fetch(req):
         return {"ok": False, "error": "unknown what: %s" % what}
     if not os.path.isfile(p):
         return {"ok": False, "exists": False, "error": "no such file: %s" % p}
+    if what == "file" and req.get("b64"):
+        # binary-safe download: raw bytes as base64 (the client saves them locally;
+        # the payload never reaches the model). Hard size cap.
+        try:
+            size = os.path.getsize(p)
+            cap = int(req.get("b64_max", 8000000))
+            if size > cap:
+                return {"ok": False, "error": "file is %d bytes (> %d download cap)" % (size, cap)}
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "path": p, "size": size,
+                "content_b64": base64.b64encode(data).decode()}
     try:
         with open(p, "rb") as f:
             f.seek(0, 2)
@@ -503,6 +602,32 @@ def op_deploy(req):
     p = _safe_under(gm, req["to"])
     if not p:
         return {"ok": False, "error": "path escapes volume"}
+    if req.get("restore"):
+        # Roll back to the last deploy backup. Deliberately does NOT re-backup the
+        # current (bad) file first — that would overwrite the good backup and make
+        # a second restore impossible. The backup is kept as-is.
+        bak = BAKROOT + "/" + u + "/" + req["to"].lstrip("/")
+        if not os.path.isfile(bak):
+            return {"ok": False, "error": "no deploy backup recorded for %s" % req["to"]}
+        try:
+            with open(bak, "rb") as f:
+                data = f.read()
+            d = os.path.dirname(p)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+            try:
+                os.chmod(p, 0o644)
+            except OSError:
+                pass
+            try:
+                os.chown(p, OWNER_UID, OWNER_GID)
+            except (OSError, AttributeError):
+                pass
+        except OSError as e:
+            return {"ok": False, "error": "restore failed: %s" % e}
+        return {"ok": True, "restored": True, "path": p, "bytes": len(data), "backup": bak}
     try:
         data = base64.b64decode(req["content_b64"])
     except Exception as e:
@@ -573,6 +698,103 @@ def op_grep(req):
     if capped:
         r["note"] = "byte-capped; narrow with path/glob or a stricter pattern"
     return r
+
+def op_diff(req):
+    import difflib, hashlib
+    def readside(u, rel):
+        gm = VOLROOT + "/" + u + "/garrysmod"
+        p = _safe_under(gm, rel)
+        if not p:
+            return None, "path escapes volume"
+        if not os.path.isfile(p):
+            return None, "no such file: %s" % rel
+        try:
+            with open(p, "rb") as f:
+                return f.read(), None
+        except OSError as e:
+            return None, str(e)
+    a, err = readside(req["uuid_a"], req["path_a"])
+    if err:
+        return {"ok": False, "error": "A(%s): %s" % (req.get("label_a", "a"), err)}
+    if req.get("content_b64") is not None:
+        try:
+            b = base64.b64decode(req["content_b64"])
+        except Exception as e:
+            return {"ok": False, "error": "bad local content: %s" % e}
+    else:
+        b, err = readside(req["uuid_b"], req["path_b"])
+        if err:
+            return {"ok": False, "error": "B(%s): %s" % (req.get("label_b", "b"), err)}
+    meta = {"ok": True, "equal": a == b, "size_a": len(a), "size_b": len(b),
+            "sha_a": hashlib.sha1(a).hexdigest()[:12], "sha_b": hashlib.sha1(b).hexdigest()[:12]}
+    if meta["equal"]:
+        return meta
+    if b"\x00" in a[:8192] or b"\x00" in b[:8192]:
+        meta["binary"] = True
+        return meta
+    d = "".join(difflib.unified_diff(
+        a.decode("utf-8", "replace").splitlines(True),
+        b.decode("utf-8", "replace").splitlines(True),
+        fromfile=req.get("label_a", "a"), tofile=req.get("label_b", "b"),
+        n=int(req.get("context", 3))))
+    if len(d) > 40000:
+        meta["truncated"] = True
+        d = d[:40000] + "\n...[diff truncated at 40KB]"
+    meta["diff"] = d
+    return meta
+
+def op_nodeinfo(req):
+    info = {}
+    try:
+        with open("/proc/loadavg") as f:
+            info["loadavg"] = f.read().split()[:3]
+    except Exception:
+        pass
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for l in f:
+                k = l.split(":")[0]
+                if k in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+                    mem[k] = int(l.split()[1]) // 1024
+        info["mem_mb"] = mem
+    except Exception:
+        pass
+    try:
+        with open("/proc/uptime") as f:
+            info["uptime_h"] = round(float(f.read().split()[0]) / 3600, 1)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["df", "-hP", "/", VOLROOT], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=15)
+        info["disk"] = r.stdout.decode("utf-8", "replace").strip()
+    except Exception as e:
+        info["disk"] = "df failed: %s" % e
+    try:
+        r = subprocess.run(["docker", "stats", "--no-stream", "--format",
+                            "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        info["docker"] = r.stdout.decode("utf-8", "replace").strip()
+    except Exception as e:
+        info["docker"] = "docker stats failed: %s" % e
+    wl = int(req.get("wings_log_lines", 0))
+    if wl > 0:
+        try:
+            r = subprocess.run(["sh", "-c", "tail -n %d /var/log/pterodactyl/wings.log" % min(wl, 200)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            info["wings_log"] = r.stdout.decode("utf-8", "replace")[-20000:]
+        except Exception as e:
+            info["wings_log"] = "tail failed: %s" % e
+    dl = int(req.get("dmesg_lines", 0))
+    if dl > 0:
+        try:
+            r = subprocess.run(["sh", "-c", "dmesg -T | tail -n %d" % min(dl, 100)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            info["dmesg"] = r.stdout.decode("utf-8", "replace")[-15000:]
+        except Exception as e:
+            info["dmesg"] = "dmesg failed: %s" % e
+    return {"ok": True, "info": info}
 
 def _wings_token():
     # The wings API bearer token lives at top-level `token:` in the wings config.
@@ -801,6 +1023,10 @@ def main():
             jout(op_deploy(req))
         elif op == "grep":
             jout(op_grep(req))
+        elif op == "diff":
+            jout(op_diff(req))
+        elif op == "nodeinfo":
+            jout(op_nodeinfo(req))
         elif op == "power":
             jout(op_power(req))
         elif op == "bootwatch":
@@ -1450,6 +1676,13 @@ def tool_lua(args):
     return ("\n".join(parts), is_error)
 
 
+def _fmt_mtime(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except Exception:
+        return "?"
+
+
 def tool_fetch(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
@@ -1458,21 +1691,79 @@ def tool_fetch(args):
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     what = args.get("what", "console")
+    save_to = args.get("save_to")
+
+    if what in ("dir", "hash", "backups"):
+        req = {"op": "fetch", "uuid": srv["uuid"], "what": what, "path": args.get("path", "")}
+        if what == "hash" and args.get("glob"):
+            req["glob"] = args["glob"]
+        res = run_driver(req, timeout=90)
+        log_event({"ev": "fetch", "server": server, "what": what, "ok": res.get("ok")})
+        if not res.get("ok"):
+            return ("fetch failed: %s" % res.get("error"), True)
+        if what == "dir":
+            ents = res.get("entries", [])
+            out = ["[%s] dir garrysmod/%s — %d entries%s" % (
+                server.upper(), args.get("path", ""), res.get("total", len(ents)),
+                " (showing first 500)" if res.get("truncated") else "")]
+            for e in ents:
+                if e.get("dir"):
+                    out.append("  %-44s     <dir>" % (e["name"] + "/"))
+                else:
+                    out.append("  %-44s %9s  %s" % (e["name"], e.get("size"), _fmt_mtime(e.get("mtime"))))
+            return ("\n".join(out), False)
+        if what == "hash":
+            files = res.get("files", {})
+            out = ["[%s] sha1 garrysmod/%s (glob=%s) — %d file(s)%s" % (
+                server.upper(), args.get("path", ""), args.get("glob") or "*",
+                res.get("count", len(files)),
+                "  [capped at 2000 — narrow path/glob]" if res.get("truncated") else "")]
+            for rel in sorted(files):
+                h, sz = files[rel]
+                out.append("  %s %9s  %s" % (h or "?" * 12, sz, rel))
+            return ("\n".join(out), False)
+        baks = res.get("backups", [])
+        out = ["[%s] deploy backups (latest per path; roll back via srcds_deploy restore:true) — %d%s" % (
+            server.upper(), len(baks), " (capped at 500)" if res.get("truncated") else "")]
+        for b in baks:
+            out.append("  %-60s %9s  %s" % (b["path"], b["size"], _fmt_mtime(b["mtime"])))
+        return ("\n".join(out), False)
+
     req = {"op": "fetch", "uuid": srv["uuid"], "what": what,
            "lines": int(args.get("lines", 200))}
     if args.get("maxbytes") is not None:
         req["maxbytes"] = int(args["maxbytes"])
     if what == "file":
         req["path"] = args.get("path", "")
+        if save_to:
+            req["b64"] = True
     if args.get("grep"):
         req["grep"] = args["grep"]
-    res = run_driver(req, timeout=40)
+    res = run_driver(req, timeout=(150 if save_to else 40))
     log_event({"ev": "fetch", "server": server, "what": what,
                "truncated": res.get("truncated"), "ok": res.get("ok")})
     if not res.get("ok"):
         if res.get("exists") is False and what == "console":
             return ("%s has no console.log (no -condebug). Use the v2 Lua bridge for live output, or fetch a specific file with what='file'." % server.upper(), True)
         return ("fetch failed: %s" % res.get("error"), True)
+    if save_to and what == "file":
+        try:
+            data = base64.b64decode(res.get("content_b64") or "")
+        except Exception as e:
+            return ("bad download transfer: %s" % e, True)
+        if os.path.exists(save_to) and args.get("overwrite") is not True:
+            return ("local file exists: %s — pass overwrite:true to replace it. Nothing was written." % save_to, True)
+        try:
+            d = os.path.dirname(save_to)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(save_to, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            return ("could not write %s: %s" % (save_to, e), True)
+        return ("[%s] downloaded garrysmod/%s -> %s (%d bytes, sha1=%s, binary-safe)"
+                % (server.upper(), args.get("path", ""), save_to, len(data),
+                   hashlib.sha1(data).hexdigest()[:12]), False)
     hdr = "[%s] %s (%s)" % (server.upper(), what, res.get("path", ""))
     if res.get("truncated"):
         hdr += "  [byte-capped -> showing most recent; raise maxbytes or narrow via grep/lines for more]"
@@ -1492,6 +1783,19 @@ def tool_deploy(args):
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
+    if args.get("restore") is True:
+        if args.get("confirm") is not True:
+            return ("BLOCKED: restore the last deploy backup over %s:garrysmod/%s. "
+                    "Re-call with confirm=true. Nothing was written." % (server, to), True)
+        res = run_driver({"op": "deploy", "uuid": srv["uuid"], "to": to, "restore": True}, timeout=45)
+        log_event({"ev": "deploy_restore", "server": server, "to": to, "ok": res.get("ok")})
+        if not res.get("ok"):
+            return ("restore failed: %s" % res.get("error"), True)
+        msg = ("[%s] RESTORED garrysmod/%s from its deploy backup (%d bytes). "
+               "The backup is kept, so restoring again stays possible." % (server.upper(), to, res.get("bytes")))
+        if to.endswith(".lua") and srv.get("running"):
+            msg += "\n(.lua — autorefresh reloads it in ~2s; verify with srcds_lua)"
+        return (msg, False)
     if args.get("local"):
         try:
             with open(args["local"], "rb") as f:
@@ -1552,6 +1856,83 @@ def tool_grep(args):
         head += "  [%s]" % res["note"]
     matches = res.get("matches", [])
     return (head + ("\n" + "\n".join(matches) if matches else ""), False)
+
+
+def tool_diff(args):
+    server = args.get("server")
+    if server not in SERVER_NAMES:
+        return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
+    path = (args.get("path") or "").strip()
+    if not path:
+        return ("path is empty", True)
+    srv = resolve(server)
+    if not srv:
+        return ("could not resolve server '%s' (host unreachable?)" % server, True)
+    server_b = args.get("server_b")
+    local = args.get("local")
+    if bool(server_b) == bool(local):
+        return ("give exactly ONE of: server_b (compare against another server) or local (a local file path).", True)
+    req = {"op": "diff", "uuid_a": srv["uuid"], "path_a": path,
+           "label_a": "%s:%s" % (server, path), "context": int(args.get("context", 3))}
+    if local:
+        try:
+            with open(local, "rb") as f:
+                req["content_b64"] = base64.b64encode(f.read()).decode()
+        except OSError as e:
+            return ("could not read local file: %s" % e, True)
+        req["label_b"] = "local:%s" % local
+    else:
+        if server_b not in SERVER_NAMES:
+            return ("server_b must be one of: %s" % ", ".join(SERVER_NAMES), True)
+        srv_b = resolve(server_b)
+        if not srv_b:
+            return ("could not resolve server '%s' (host unreachable?)" % server_b, True)
+        path_b = (args.get("path_b") or path).strip()
+        req["uuid_b"] = srv_b["uuid"]
+        req["path_b"] = path_b
+        req["label_b"] = "%s:%s" % (server_b, path_b)
+    res = run_driver(req, timeout=60)
+    log_event({"ev": "diff", "server": server, "path": path,
+               "vs": (server_b or "local"), "ok": res.get("ok"), "equal": res.get("equal")})
+    if not res.get("ok"):
+        return ("diff failed: %s" % res.get("error"), True)
+    head = "[diff] %s  vs  %s" % (req["label_a"], req["label_b"])
+    if res.get("equal"):
+        return (head + " — IDENTICAL (%s bytes, sha1 %s)" % (res.get("size_a"), res.get("sha_a")), False)
+    if res.get("binary"):
+        return (head + " — BINARY files DIFFER: %s vs %s bytes (sha1 %s vs %s)" % (
+            res.get("size_a"), res.get("size_b"), res.get("sha_a"), res.get("sha_b")), False)
+    cap = "  [truncated at 40KB]" if res.get("truncated") else ""
+    return (head + " — DIFFER (%s vs %s bytes)%s\n%s" % (
+        res.get("size_a"), res.get("size_b"), cap, res.get("diff", "")), False)
+
+
+def tool_nodeinfo(args):
+    res = run_driver({"op": "nodeinfo",
+                      "wings_log_lines": int(args.get("wings_log_lines", 0)),
+                      "dmesg_lines": int(args.get("dmesg_lines", 0))}, timeout=60)
+    log_event({"ev": "nodeinfo", "ok": res.get("ok")})
+    if not res.get("ok"):
+        return ("nodeinfo failed: %s" % res.get("error"), True)
+    i = res.get("info", {})
+    out = ["Node health:"]
+    if i.get("loadavg"):
+        out.append("  load (1/5/15m): %s" % " ".join(i["loadavg"]))
+    m = i.get("mem_mb") or {}
+    if m:
+        out.append("  mem: %s MB available of %s MB  (swap free %s of %s MB)" % (
+            m.get("MemAvailable"), m.get("MemTotal"), m.get("SwapFree"), m.get("SwapTotal")))
+    if i.get("uptime_h") is not None:
+        out.append("  uptime: %s h" % i["uptime_h"])
+    if i.get("disk"):
+        out.append("  disk:\n    " + i["disk"].replace("\n", "\n    "))
+    if i.get("docker"):
+        out.append("  docker stats (name|cpu|mem):\n    " + i["docker"].replace("\n", "\n    "))
+    if i.get("wings_log"):
+        out.append("--- wings.log tail ---\n" + i["wings_log"].rstrip())
+    if i.get("dmesg"):
+        out.append("--- dmesg tail ---\n" + i["dmesg"].rstrip())
+    return ("\n".join(out), False)
 
 
 CLIENTLUA_BODY = r'''
@@ -1799,16 +2180,19 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only: tail a server's console.log (what='console'; only servers launched with -condebug have one — srcds_status shows which), or read any file under the server's garrysmod/ volume (what='file', path relative to garrysmod/). Always allowed.",
+        "description": "Read-only volume access, always allowed. what='console': tail console.log (only -condebug servers have one — srcds_status shows which). what='file': read a file; add save_to=<local path> for a binary-safe download (crash dumps, .db). what='dir': list a directory (sizes+mtimes). what='hash': sha1 every file under a path — compare two servers' listings to spot divergence, then srcds_diff the files that differ. what='backups': list deploy backups (restore via srcds_deploy restore:true).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "what": {"type": "string", "enum": ["console", "file"], "default": "console"},
-                "lines": {"type": "integer", "default": 200, "description": "Tail this many lines."},
-                "path": {"type": "string", "description": "For what='file': path relative to garrysmod/ (e.g. cfg/server.cfg)."},
-                "grep": {"type": "string", "description": "Optional substring filter."},
-                "maxbytes": {"type": "integer", "default": 48000, "description": "Byte cap on returned content (keeps the most-recent slice) — guards against long-line over-returns inflating tokens. ANSI color codes are always stripped."},
+                "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups"], "default": "console"},
+                "lines": {"type": "integer", "default": 200, "description": "what='console': tail this many lines."},
+                "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
+                "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
+                "grep": {"type": "string", "description": "Optional substring filter (console/file)."},
+                "maxbytes": {"type": "integer", "default": 48000, "description": "Byte cap on returned content (keeps the most-recent slice). ANSI color codes are always stripped."},
+                "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
+                "overwrite": {"type": "boolean", "default": False, "description": "Allow save_to to replace an existing local file."},
             },
             "required": ["server"],
         },
@@ -1855,7 +2239,7 @@ TOOLS = [
     },
     {
         "name": "srcds_deploy",
-        "description": "Write a file to a server's volume (deploy an addon .lua, cfg, etc.). Provide 'local' (a local file path to copy) OR 'content' (inline string). Path 'to' is relative to garrysmod/ (no '..'/absolute). UTF-8/CJK-safe (driver write, not scp). Backs up an overwritten file to an out-of-tree backups root by default (never drops backup files into source/addon/git trees). .lua files hot-reload via autorefresh. Works even if the server is DOWN (loads on boot). Requires confirm=true.",
+        "description": "Write a file to a server's volume (deploy an addon .lua, cfg, etc.). Provide 'local' (a local file path to copy) OR 'content' (inline string). Path 'to' is relative to garrysmod/ (no '..'/absolute). UTF-8/CJK-safe (driver write, not scp). Backs up an overwritten file to an out-of-tree backups root by default (never drops backup files into source/addon/git trees). restore:true ROLLS BACK 'to' to its last deploy backup (list them via srcds_fetch what='backups'). .lua files hot-reload via autorefresh. Works even if the server is DOWN (loads on boot). Requires confirm=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1863,7 +2247,8 @@ TOOLS = [
                 "to": {"type": "string", "description": "Destination path relative to garrysmod/, e.g. 'addons/rals/lua/autorun/server/x.lua' or 'cfg/foo.cfg'."},
                 "local": {"type": "string", "description": "A local file path to read and copy (preferred for real files)."},
                 "content": {"type": "string", "description": "Inline file content (use instead of 'local' for small/generated files)."},
-                "backup": {"type": "boolean", "default": True, "description": "Back up an overwritten file to the out-of-tree backups root (/var/lib/pterodactyl/srcds_mcp_backups/<uuid>/<path>), not next to the file."},
+                "restore": {"type": "boolean", "default": False, "description": "Roll back 'to' to its last deploy backup instead of writing new content (local/content ignored; the backup is kept)."},
+                "backup": {"type": "boolean", "default": True, "description": "Back up an overwritten file to the out-of-tree backups root, not next to the file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true to actually write."},
             },
             "required": ["server", "to"],
@@ -1882,6 +2267,33 @@ TOOLS = [
                 "max": {"type": "integer", "default": 200, "description": "Max matches to return."},
             },
             "required": ["server", "pattern"],
+        },
+    },
+    {
+        "name": "srcds_diff",
+        "description": "Unified diff of a DEPLOYED file: compare the same (or another) path across two servers, or a deployed file against a LOCAL file — the fast way to check local<->live and server<->server divergence before deploying. Reports IDENTICAL / DIFFER (+diff, 40KB cap) / binary mismatch with sizes+sha1. For whole trees: compare srcds_fetch what='hash' listings first, then diff the files whose hashes differ. Read-only, always allowed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "server": SERVER_ENUM,
+                "path": {"type": "string", "description": "Side A: path relative to garrysmod/ on `server`."},
+                "server_b": {"type": "string", "enum": list(SERVER_NAMES), "description": "Side B server (same path unless path_b). Give this OR local."},
+                "path_b": {"type": "string", "description": "Optional different path on server_b."},
+                "local": {"type": "string", "description": "Side B = this LOCAL file path. Give this OR server_b."},
+                "context": {"type": "integer", "default": 3, "description": "Diff context lines."},
+            },
+            "required": ["server", "path"],
+        },
+    },
+    {
+        "name": "srcds_nodeinfo",
+        "description": "Host-node health (read-only, always allowed): loadavg, memory/swap, uptime, disk usage (/ + volumes root), per-container docker stats. Optional forensics tails: wings_log_lines (Pterodactyl wings log — crash-detection lines live here) and dmesg_lines (kernel log — OOM-killer traces).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "wings_log_lines": {"type": "integer", "default": 0, "description": "Also tail this many lines of the wings log (max 200)."},
+                "dmesg_lines": {"type": "integer", "default": 0, "description": "Also tail this many lines of dmesg -T (max 100)."},
+            },
         },
     },
     {
@@ -1953,6 +2365,8 @@ DISPATCH = {
     "srcds_lua": tool_lua,
     "srcds_deploy": tool_deploy,
     "srcds_grep": tool_grep,
+    "srcds_diff": tool_diff,
+    "srcds_nodeinfo": tool_nodeinfo,
     "srcds_clientlua": tool_clientlua,
     "srcds_power": tool_power,
     "srcds_db_query": tool_db_query,
@@ -1977,7 +2391,7 @@ def handle(msg):
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": params.get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "srcds-mcp", "version": "1.2.0"},
+            "serverInfo": {"name": "srcds-mcp", "version": "1.3.0"},
         }})
         return
     if method == "notifications/initialized" or method == "initialized":
