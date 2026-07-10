@@ -1,13 +1,15 @@
 # Per-developer config — contains your local SSH key path; never commit.
-config.json
+# config*.json also catches per-node configs (e.g. config.nodeb.json).
+config*.json
+!config.example.json
 
 # Secrets — the SSH private key must never end up in the repo/bundle.
 *.pem
 *.key
 *.ppk
 
-# Runtime log (JSONL trace of every tool call).
-srcds_mcp.log
+# Runtime logs (JSONL trace of every tool call; one per config in multi-node).
+*.log
 
 # Python bytecode cache.
 __pycache__/

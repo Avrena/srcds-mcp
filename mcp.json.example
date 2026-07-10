@@ -7,6 +7,8 @@
     }
   },
 
+  "// multinode": "Second Pterodactyl node? Register the script AGAIN under another name with env SRCDS_MCP_CONFIG pointing at a second config file - see README 'Multiple nodes'.",
+
   "// codex": "For Codex CLI instead of Claude Code, this goes in ~/.codex/config.toml as:",
   "// codex_toml": "[mcp_servers.srcds]\ncommand = 'C:\\\\Users\\\\YOU\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python310\\\\python.exe'\nargs = ['C:\\\\Users\\\\YOU\\\\tools\\\\srcds-mcp\\\\srcds_mcp.py']"
 }

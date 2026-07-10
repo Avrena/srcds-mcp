@@ -111,6 +111,51 @@ baked into the uploaded host driver, so the driver is byte-identical across ever
 on the same node (stable content hash); a different deployment yields a different,
 correctly-namespaced driver.
 
+### Adding a server
+
+A new game server on the same node is pure config — no code changes:
+
+1. Pick a **marker**: a directory that uniquely exists under that server's
+   `garrysmod/` (its gamemode folder, or a signature addon).
+2. Add it to `config.json`:
+   ```json
+   "servers": [
+     { "logical": "scprp",  "marker": "addons/your-scp-addon" },
+     { "logical": "breach", "marker": "gamemodes/breach" }
+   ]
+   ```
+3. Optionally give it a `live_thresholds` entry (`"breach": 10`) and a
+   `db_aliases` entry for its schema.
+4. **Restart your MCP client.** The server-name enum and the tool descriptions
+   are baked at startup, so the new name only appears after a restart.
+
+That's it — UUID, port, and up/down state are discovered live, so the new name
+simply starts resolving.
+
+### Multiple nodes
+
+One instance of this server talks to **one** node (`ssh.host`). For a second
+node, register `srcds_mcp.py` a **second time** under a different name, with
+`SRCDS_MCP_CONFIG` pointing at a second config file:
+
+```json
+"mcpServers": {
+  "srcds": {
+    "command": "C:/.../python.exe", "args": ["C:/.../srcds-mcp/srcds_mcp.py"]
+  },
+  "srcds-nodeb": {
+    "command": "C:/.../python.exe", "args": ["C:/.../srcds-mcp/srcds_mcp.py"],
+    "env": { "SRCDS_MCP_CONFIG": "C:/.../srcds-mcp/config.nodeb.json" }
+  }
+}
+```
+
+MCP clients namespace tools per registration, so both fleets coexist (e.g. in
+Claude Code: `mcp__srcds__srcds_status` vs `mcp__srcds-nodeb__srcds_status`).
+Each instance uploads its own hash-namespaced driver and writes its own log
+(`config.nodeb.json.log`). Per-node config files match the `config*.json`
+gitignore rule, so they can't be committed by accident either.
+
 ---
 
 ## Why it's built the way it is
@@ -152,12 +197,12 @@ don't hit the Windows ~32 KB command-line limit**.
 | --- | --- | --- |
 | `srcds_status` | always allowed | up/down, **live player count (A2S)**, LIVE flag vs thresholds, port, condebug |
 | `srcds_fetch` | always allowed | tail `console.log` or read any file under `garrysmod/`; ANSI stripped, output byte-capped (`maxbytes`, default 48 KB) |
-| `srcds_console` | confirm if destructive | inject a console command; returns the console.log delta where `-condebug` is on |
+| `srcds_console` | confirm if destructive | inject a console command; returns the console.log delta where `-condebug` is on (ANSI-stripped, byte-capped like fetch) |
 | `srcds_lua` | confirm if mutating | run server Lua / **multi-line verification suites**; captures output + `return <expr>` with an assertion harness |
 | `srcds_deploy` | confirm | write a local file / inline content to the volume; UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `.lua` hot-reloads, works even if server DOWN |
 | `srcds_grep` | always allowed | recursive `grep` across the **deployed** volume source (find symbols / local-vs-remote divergence) |
 | `srcds_clientlua` | confirm | run **clientside** Lua on connected players (chunked base64 `SendLua`); UI/PAC3 hot-reload without reconnect |
-| `srcds_power` | confirm (+force if LIVE) | wings-API start/stop/restart/kill (graceful, not a crash) |
+| `srcds_power` | confirm (+force if LIVE) | wings-API start/stop/restart/kill (graceful, not a crash); `action:"watch"` awaits boot completion |
 | `srcds_db_query` | read auto / write confirm | SQL against the game MariaDB; SELECT/SHOW auto, INSERT/UPDATE/DELETE/DDL need confirm |
 | `srcds_db_schema` | always allowed | browse databases → tables (row counts) → columns/indexes |
 
@@ -173,6 +218,24 @@ clientside) → **`srcds_power`** (boot a server that's off).
 - `srcds_deploy {server:"scprp", to:"addons/x/lua/autorun/server/y.lua", local:"C:/.../y.lua", confirm:true}`.
 
 *(`scprp` here is just whatever you named a server in `config.json` → `servers`.)*
+
+### Boot watch (know when a start/restart is actually done)
+
+A GMod server takes minutes to boot; the wings power call returns in seconds.
+`start`/`restart` therefore arm a small detached **boot watcher** on the node.
+The boot marker is owned by the **Pterodactyl end**: wings flips the server
+state `starting → running` when the egg's startup-done line appears in the
+console — the watcher just records that transition. Then:
+
+```
+srcds_power {server:"scprp", action:"watch", wait:50}
+```
+
+is read-only (no confirm) and **returns early the moment the boot completes** —
+`BOOT COMPLETE: ... running 87.3s after the power action` — or reports
+`still booting` / `DIED DURING BOOT` (with the state history) / a 15-minute
+timeout. For an AI client this *is* the boot notification: call `watch` with
+`wait:50` in a loop instead of polling `srcds_status`.
 
 ### Database (MariaDB)
 If the node runs a `mariadb` container, the DB tools query it via `docker exec` and
@@ -251,7 +314,8 @@ lines `file.Write`n to `data/_mcp/<token>.txt` (works on every server regardless
 - **`config: …`** → see the big "READ THIS FIRST" section above.
 - **"could not upload host driver / SSH failed"** → network/VPN to the node, the key
   path, and that your `ssh.bin` exists.
-- **"server DOWN"** → boot it with `srcds_power {server:"<name>", action:"start", confirm:true}`.
+- **"server DOWN"** → boot it with `srcds_power {server:"<name>", action:"start", confirm:true}`,
+  then `srcds_power {server:"<name>", action:"watch", wait:50}` until it says `BOOT COMPLETE`.
 - **Lua syntax error** → captured as a framed `ERR` carrying your own body line number;
   the call is marked `isError`.
 - **`srcds_power`** drives the **wings API** (same path as the panel buttons), so a

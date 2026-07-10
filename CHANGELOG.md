@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.0 — Boot watcher, token-lean output, config-derived descriptions
+Output-size hardening for LLM clients, boot-completion notification, and the
+last de-branding pass.
+
+- **Boot watcher.** `srcds_power` `start`/`restart` now arm a detached host-side
+  watcher keyed to Pterodactyl's own boot marker (wings flips `starting →
+  running` on the egg's startup-done line). New read-only
+  `action:"watch"` (`wait` up to 55 s) long-polls and returns the moment the
+  boot completes — reporting boot duration, `still booting` progress, or
+  `DIED DURING BOOT` with the state history. No more `srcds_status` babysitting.
+- **`srcds_console` output is now ANSI-stripped and byte-capped** (default 24 KB,
+  new `maxbytes` arg), same policy as `srcds_fetch` — previously a chatty live
+  console could return a ~200 KB delta littered with truecolor escapes.
+- **`srcds_grep` caps each match line at 300 chars** (a match inside a
+  minified/packed line used to return the entire line) **and the total payload
+  at 40 KB**, with a note when capped.
+- **Tool descriptions are built from your config**: server names come from
+  `servers[]` and the DB-alias list from `db_aliases`, instead of hardcoding one
+  deployment's names and per-server `-condebug` facts. Status header, module
+  docstring, and `serverInfo` (`srcds-mcp`) de-branded to match.
+- `srcds_status` no longer emits a blank line for servers without a hostname.
+- README: new **"Adding a server"** and **"Multiple nodes"**
+  (`SRCDS_MCP_CONFIG` double-registration) sections.
+- Multi-node hygiene: `.gitignore` now covers `config*.json` and `*.log`; an
+  instance started with `SRCDS_MCP_CONFIG` logs beside its own config file.
+
 ## 1.1.0 — Public release packaging
 First shareable, open build. Config-driven and sanitized: the repo ships with
 **blank connection settings and no real endpoints/keys** — you supply the node

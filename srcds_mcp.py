@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-srcds-ncg : zero-dependency stdio MCP server for driving the NCG GMod servers
-(SCPRP / DRP / ZCity) remotely from Claude Code.
+srcds-mcp : zero-dependency stdio MCP server for driving live Garry's Mod /
+srcds servers hosted under Pterodactyl, from Claude Code or any MCP client.
 
-v1 transport: SSH -> host-side python driver -> pty.fork(docker attach) console
-injection, with output read back from `-condebug` console.log where available.
+Transport: SSH -> host-side python driver -> pty.fork(docker attach) console
+injection. Console output is read back from `-condebug` console.log where
+available; Lua output goes through a volume file and works on every server.
 
 No third-party packages. Stdlib only. Speaks MCP over newline-delimited JSON-RPC
 on stdin/stdout.
 
-Tools:
-  srcds_status                     read-only : which servers are up, players, LIVE flag
-  srcds_fetch(server, ...)         read-only : tail console.log / read a volume file
-  srcds_console(server, command)   write     : inject a console command (confirm-gated if destructive)
-  srcds_lua(server, code)          write     : run server Lua, capture output (confirm-gated if mutating)
+Tools: srcds_status, srcds_fetch, srcds_console, srcds_lua, srcds_deploy,
+srcds_grep, srcds_clientlua, srcds_power, srcds_db_query, srcds_db_schema.
+Server names come from config.json (`servers[]`).
 
 Safety: reads are always allowed; writes that look destructive/mutating require
 confirm=true. Every call is logged to srcds_mcp.log next to this file.
@@ -128,7 +127,10 @@ LIVE_THRESHOLD = CFG.get("live_thresholds") or {}
 # Valid logical server names, derived from the configured topology.
 SERVER_NAMES = tuple(s["logical"] for s in CFG.get("servers", []) if s.get("logical"))
 
-LOG_PATH = os.path.join(_HERE, "srcds_mcp.log")
+# One log per config: a second registration (multi-node via SRCDS_MCP_CONFIG)
+# logs beside its own config file instead of interleaving with the default's.
+LOG_PATH = ((CFG_PATH + ".log") if os.environ.get("SRCDS_MCP_CONFIG")
+            else os.path.join(_HERE, "srcds_mcp.log"))
 
 SSH_BASE = [
     SSH_BIN,
@@ -300,12 +302,26 @@ def op_console(req):
     before = file_size(log) if condebug else None
     inject(cid, req["cmd"], req.get("lead", 1.0), req.get("trail", 2.5))
     out = ""
+    truncated = False
     if condebug and before is not None:
         out = read_delta(log, before)
         pat = req.get("grep")
         if pat:
             out = "\n".join(l for l in out.splitlines() if pat in l)
-    return {"ok": True, "running": True, "condebug": condebug, "output": out,
+        # Strip ANSI color noise FIRST (on chatty servers it can be a third of the
+        # bytes), then byte-cap what the client actually has to read. Keep the
+        # most-recent (end) slice, same policy as op_fetch.
+        out = _ANSI_RE.sub("", out)
+        maxb = int(req.get("maxbytes", 24000))
+        orig = len(out)
+        truncated = orig > maxb
+        if truncated:
+            out = out[orig - maxb:]
+            nl = out.find("\n")            # drop the leading partial line for cleanliness
+            if 0 <= nl < 240:
+                out = out[nl + 1:]
+            out = "...[truncated: last %d of %d chars]...\n%s" % (len(out), orig, out)
+    return {"ok": True, "running": True, "condebug": condebug, "output": out, "truncated": truncated,
             "note": ("" if condebug else "no -condebug: command injected but output not captured (blind write)")}
 
 def op_lua(req):
@@ -541,8 +557,22 @@ def op_grep(req):
     lines = out.splitlines()
     total = len(lines)
     pref = os.path.normpath(gm) + "/"
-    shown = [l.replace(pref, "") for l in lines[:mx]]
-    return {"ok": True, "matches": shown, "total": total, "shown": len(shown)}
+    # Cap each line (a match inside a minified/packed line would otherwise return
+    # the WHOLE line) and the total payload, so one grep can't flood the client.
+    shown, used, capped = [], 0, False
+    for l in lines[:mx]:
+        l = l.replace(pref, "")
+        if len(l) > 300:
+            l = l[:300] + "...<+%d chars>" % (len(l) - 300)
+        if used + len(l) + 1 > 40000:
+            capped = True
+            break
+        used += len(l) + 1
+        shown.append(l)
+    r = {"ok": True, "matches": shown, "total": total, "shown": len(shown)}
+    if capped:
+        r["note"] = "byte-capped; narrow with path/glob or a stricter pattern"
+    return r
 
 def _wings_token():
     # The wings API bearer token lives at top-level `token:` in the wings config.
@@ -604,6 +634,115 @@ def op_power(req):
     return {"ok": r.returncode == 0, "rc": r.returncode, "via": "docker",
             "out": "docker %s fallback (%s): %s" % (action, wings_err, msg[-300:])}
 
+# --- boot watcher -------------------------------------------------------------
+# Boot-complete detection is done at the PTERODACTYL end: wings flips the server
+# state "starting" -> "running" when the egg's startup-done marker appears in the
+# console. The watcher is a tiny detached process that polls wings' per-server
+# state and records the transition to /tmp, so an MCP client can (long-)poll for
+# "BOOT COMPLETE" without babysitting the console itself.
+WATCH_SRC = """
+import sys, json, time, re, urllib.request
+u, api, cfgpath, out, action = sys.argv[1:6]
+def token():
+    try:
+        for line in open(cfgpath):
+            if line.startswith("token:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+def state():
+    tok = token()
+    if not tok:
+        return None
+    try:
+        rq = urllib.request.Request(api + "/api/servers/" + u,
+                                    headers={"Authorization": "Bearer " + tok, "Accept": "application/json"})
+        b = urllib.request.urlopen(rq, timeout=8).read().decode("utf-8", "replace")
+        m = re.search(r'"state"\\s*:\\s*"([a-z]+)"', b)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+def write(d):
+    try:
+        with open(out, "w") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+t0 = time.time(); last = None; seen_start = False
+d = {"armed": t0, "action": action, "phase": "watching", "state": None, "history": []}
+write(d)
+while time.time() < t0 + 900:
+    s = state()
+    if s != last:
+        last = s
+        d["state"] = s
+        d["history"].append([round(time.time() - t0, 1), s])
+        if s in ("starting", "running"):
+            seen_start = True
+        if s == "running":
+            d["phase"] = "booted"; d["t_boot"] = round(time.time() - t0, 1)
+            write(d); sys.exit(0)
+        if s == "offline" and seen_start:
+            d["phase"] = "died_during_boot"; write(d); sys.exit(0)
+        write(d)
+    time.sleep(2)
+d["phase"] = "timeout"
+write(d)
+"""
+
+def _watch_path(u):
+    return "/tmp/srcds_bootwatch_%s.json" % u
+
+def op_bootwatch(req):
+    u = req["uuid"]; mode = req.get("mode", "poll")
+    out = _watch_path(u)
+    if mode == "arm":
+        try:
+            os.remove(out)                       # clear a stale verdict from a previous boot
+        except OSError:
+            pass
+        try:
+            subprocess.Popen(["python3", "-c", WATCH_SRC, u, WINGS_API, WINGS_CONFIG, out,
+                              req.get("action", "?")],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:
+            return {"ok": False, "error": "arm watcher: %s" % e}
+        return {"ok": True, "armed": True}
+    # poll: optionally long-poll (server-side) until the watcher reaches a verdict.
+    deadline = time.time() + min(float(req.get("wait", 0)), 55)
+    d = None
+    while True:
+        try:
+            with open(out) as f:
+                d = json.load(f)
+        except Exception:
+            d = None
+        if d and d.get("phase") != "watching":
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(2)
+    if d and "armed" in d:
+        d["elapsed"] = round(time.time() - d["armed"], 1)   # node-side clock, no skew
+    # live wings state too, so a dead/never-armed watcher still yields an answer
+    live = None; live_err = None
+    token = _wings_token()
+    if not token:
+        live_err = "wings token not found"
+    else:
+        import urllib.request
+        rq = urllib.request.Request(WINGS_API + "/api/servers/" + u,
+                                    headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+        try:
+            body = urllib.request.urlopen(rq, timeout=10).read().decode("utf-8", "replace")
+            m = re.search(r'"state"\s*:\s*"([a-z]+)"', body)
+            live = m.group(1) if m else None
+        except Exception as e:
+            live_err = "wings state: %s" % e
+    return {"ok": True, "watch": d, "state": live, "state_err": live_err}
+
 def _mariadb_cid():
     for name, cid in docker_ps().items():
         if "maria" in name.lower():
@@ -664,6 +803,8 @@ def main():
             jout(op_grep(req))
         elif op == "power":
             jout(op_power(req))
+        elif op == "bootwatch":
+            jout(op_bootwatch(req))
         elif op == "db":
             jout(op_db(req))
         else:
@@ -915,7 +1056,7 @@ def tool_status(args):
     servers = discover(force=True)
     if not servers:
         return ("Could not reach the host (SSH/driver failed). Check VPN / key / host.", True)
-    lines = ["NCG game servers (resolved live):", ""]
+    lines = ["Game servers (resolved live):", ""]
     for s in sorted(servers, key=lambda x: x["logical"]):
         if want and s["logical"] != want:
             continue
@@ -934,7 +1075,8 @@ def tool_status(args):
         cap = "condebug" if s["condebug"] else "NO-condebug(blind)"
         lines.append("  %-6s  UP  %-22s  %-22s  port=%s  %s" % (
             tag, pc, live_s, s.get("port"), cap))
-        lines.append("          %s" % (s.get("hostname") or ""))
+        if s.get("hostname"):
+            lines.append("          %s" % s["hostname"])
     lines.append("")
     if LIVE_THRESHOLD:
         lines.append("Live thresholds: " + ", ".join(
@@ -974,7 +1116,8 @@ def tool_console(args):
             log_event({"ev": "console_blocked", "server": server, "cmd": command, "reason": reason})
             return (blocked, True)
     res = run_driver({"op": "console", "uuid": srv["uuid"], "cmd": command,
-                      "grep": args.get("grep")}, timeout=45)
+                      "grep": args.get("grep"),
+                      "maxbytes": int(args.get("maxbytes", 24000))}, timeout=45)
     log_event({"ev": "console", "server": server, "cmd": command,
                "confirm": bool(args.get("confirm")), "ok": res.get("ok")})
     if not res.get("ok"):
@@ -982,6 +1125,8 @@ def tool_console(args):
     out = res.get("output", "") or "(no console.log output captured)"
     note = res.get("note", "")
     head = "[%s] injected: %s" % (server.upper(), command)
+    if res.get("truncated"):
+        head += "  [byte-capped -> most recent; raise maxbytes or narrow with grep]"
     if note:
         head += "\n(note: %s)" % note
     return (head + "\n--- console.log delta ---\n" + out, False)
@@ -1403,6 +1548,8 @@ def tool_grep(args):
     head = "[%s] grep '%s' in %s/%s — %d match(es)%s" % (
         server.upper(), pattern, (path or "."), glob, total,
         ("" if total <= shown else " (showing first %d)" % shown))
+    if res.get("note"):
+        head += "  [%s]" % res["note"]
     matches = res.get("matches", [])
     return (head + ("\n" + "\n".join(matches) if matches else ""), False)
 
@@ -1473,11 +1620,39 @@ def tool_power(args):
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
     action = args.get("action", "")
-    if action not in ("start", "stop", "restart", "kill"):
-        return ("action must be one of: start, stop, restart, kill", True)
+    if action not in ("start", "stop", "restart", "kill", "watch"):
+        return ("action must be one of: start, stop, restart, kill, watch", True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
+    if action == "watch":
+        # Read-only boot progress check (no confirm). The Pterodactyl end owns the
+        # boot marker: wings turns state "starting"->"running" on the egg's
+        # startup-done line; the armed watcher records that transition.
+        wait = max(0, min(int(args.get("wait", 0)), 55))
+        res = run_driver({"op": "bootwatch", "uuid": srv["uuid"], "mode": "poll",
+                          "wait": wait}, timeout=wait + 35)
+        log_event({"ev": "power_watch", "server": server, "wait": wait, "ok": res.get("ok")})
+        if not res.get("ok"):
+            return ("boot watch failed: %s" % res.get("error"), True)
+        d = res.get("watch") or {}
+        live = res.get("state") or ("? (%s)" % res.get("state_err"))
+        phase = d.get("phase")
+        head = "[%s] boot watch — wings state: %s" % (server.upper(), live)
+        if phase == "booted":
+            return (head + "\nBOOT COMPLETE: Pterodactyl marked it running %ss after the power action. "
+                           "Verify with srcds_status / srcds_lua." % d.get("t_boot"), False)
+        if phase == "died_during_boot":
+            return (head + "\nDIED DURING BOOT: went offline again before reaching running "
+                           "(history: %s). Check srcds_fetch console." % json.dumps(d.get("history")), True)
+        if phase == "timeout":
+            return (head + "\nWatcher gave up after 15min without seeing running.", True)
+        if phase == "watching":
+            return (head + "\nStill booting (%ss elapsed, history: %s). Call action='watch' with "
+                           "wait=50 again — it returns early on BOOT COMPLETE."
+                    % (d.get("elapsed"), json.dumps(d.get("history"))), False)
+        return (head + "\nNo watcher armed for the last power action; the live wings state above "
+                       "is all we know. (start/restart arm one automatically.)", False)
     players, maxpl, is_live = live_info(srv)
     if args.get("confirm") is not True:
         ln = ("  Currently %d/%s players%s." % (players, maxpl, " — LIVE!" if is_live else "")) if players is not None else ""
@@ -1494,8 +1669,17 @@ def tool_power(args):
                 "if wings is down, use the Pterodactyl panel at %s.)"
                 % (action, res.get("rc"), via, res.get("error") or res.get("out"), PANEL_URL), True)
     note = "  Graceful (normal quit, not a crash)." if via == "wings" else "  (docker fallback - wings was unreachable.)"
-    return ("[%s] %s OK via %s. %s%s\nWatch it with srcds_status."
-            % (server.upper(), action.upper(), via, res.get("out", ""), note), False)
+    tail = "\nWatch it with srcds_status."
+    if action in ("start", "restart") and args.get("watch", True):
+        arm = run_driver({"op": "bootwatch", "uuid": srv["uuid"], "mode": "arm",
+                          "action": action}, timeout=25)
+        if arm.get("ok"):
+            tail = ("\nBoot watcher armed (tracks Pterodactyl's starting->running marker). "
+                    "Poll srcds_power {action:'watch', wait:50} — it returns when the boot completes.")
+        else:
+            tail = "\n(boot watcher failed to arm: %s — fall back to srcds_status polling.)" % arm.get("error")
+    return ("[%s] %s OK via %s. %s%s%s"
+            % (server.upper(), action.upper(), via, res.get("out", ""), note, tail), False)
 
 
 # ----------------------------------------------------------------------------
@@ -1597,10 +1781,16 @@ def tool_db_schema(args):
 SERVER_ENUM = {"type": "string", "enum": list(SERVER_NAMES),
                "description": "Which server. One of: %s." % ", ".join(SERVER_NAMES)}
 
+# Descriptions are built from the configured topology so they stay truthful for
+# any deployment (and after servers are added) — never hardcode server names here.
+_NAMES_TXT = ", ".join(SERVER_NAMES) or "(none configured — set servers[] in config.json)"
+_ALIAS_TXT = ("" if not DB_ALIAS else
+              " Configured aliases: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(DB_ALIAS.items())) + ".")
+
 TOOLS = [
     {
         "name": "srcds_status",
-        "description": "List the NCG GMod servers (SCPRP/DRP/ZCity): up/down, live player count (via A2S), LIVE flag vs per-server thresholds, port, and whether console output capture is available. Read-only, always allowed.",
+        "description": "List the configured game servers (%s): up/down, live player count (via A2S), LIVE flag vs per-server thresholds, port, and whether console output capture (-condebug) is available. Read-only, always allowed." % _NAMES_TXT,
         "inputSchema": {
             "type": "object",
             "properties": {"server": {"type": "string", "enum": list(SERVER_NAMES),
@@ -1609,7 +1799,7 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only: tail a server's console.log (what='console', SCPRP only — DRP/ZCity have no -condebug), or read any file under the server's garrysmod/ volume (what='file', path relative to garrysmod/). Always allowed.",
+        "description": "Read-only: tail a server's console.log (what='console'; only servers launched with -condebug have one — srcds_status shows which), or read any file under the server's garrysmod/ volume (what='file', path relative to garrysmod/). Always allowed.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1625,13 +1815,14 @@ TOOLS = [
     },
     {
         "name": "srcds_console",
-        "description": "Inject a server console command via the pty/docker-attach path (servers run -norcon). On SCPRP the console.log delta is returned; on DRP/ZCity the command runs blind (no -condebug). Destructive commands (kick/ban/changelevel/map/password/restart/...) require confirm=true.",
+        "description": "Inject a server console command via the pty/docker-attach path (works on -norcon servers). Where -condebug is on, the console.log delta is returned (ANSI-stripped, byte-capped); otherwise the command runs blind. Destructive commands (kick/ban/changelevel/map/password/restart/...) require confirm=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "command": {"type": "string", "description": "The console command, e.g. 'status' or 'ulx adduser ...'."},
                 "grep": {"type": "string", "description": "Optional substring filter on captured output."},
+                "maxbytes": {"type": "integer", "default": 24000, "description": "Byte cap on the returned console.log delta (keeps the most-recent slice)."},
                 "confirm": {"type": "boolean", "default": False, "description": "Set true to authorize a destructive command."},
             },
             "required": ["server", "command"],
@@ -1647,7 +1838,7 @@ TOOLS = [
             "ANY failed check marks the call as an error. A top-level `return <expr>` (numbers/strings/"
             "booleans/tables) is captured and safely serialized (entities/vectors tagged; cycles & "
             "functions won't crash). Globals you set do NOT pollute _G; a runaway loop is auto-aborted. "
-            "Output is captured on ALL servers (scprp/drp/zcity) via a volume file. For timer/coroutine suites set "
+            "Output is captured on ALL servers via a volume file (works without -condebug). For timer/coroutine suites set "
             "async=true and call MCP_DONE() when finished. Mutating/obfuscated Lua (Set*/Kill/Remove/Kick/"
             "Give/file.Write/RunConsoleCommand/_G[]/loadstring/...) requires confirm=true."),
         "inputSchema": {
@@ -1709,14 +1900,17 @@ TOOLS = [
     },
     {
         "name": "srcds_power",
-        "description": "Power-control a server via the Pterodactyl wings API (start/stop/restart/kill) — graceful, like the panel button: a stop/restart is a NORMAL quit (exit 0, NOT flagged as a crash) and the server reliably comes back up; wings `start` even recreates a removed container. Requires confirm=true; stopping/restarting/killing a LIVE server additionally needs force=true. (Falls back to raw docker only if wings is unreachable.)",
+        "description": "Power-control a server via the Pterodactyl wings API (start/stop/restart/kill) — graceful, like the panel button: a stop/restart is a NORMAL quit (exit 0, NOT flagged as a crash) and the server reliably comes back up; wings `start` even recreates a removed container. Requires confirm=true; stopping/restarting/killing a LIVE server additionally needs force=true. start/restart also arm a host-side BOOT WATCHER keyed to Pterodactyl's own boot marker (wings state starting->running); then action='watch' with wait=50 (read-only, no confirm) long-polls and returns as soon as the boot completes — call it after every start/restart instead of polling srcds_status. (Falls back to raw docker only if wings is unreachable.)",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "action": {"type": "string", "enum": ["start", "stop", "restart", "kill"]},
-                "confirm": {"type": "boolean", "default": False, "description": "Required true to perform the action."},
+                "action": {"type": "string", "enum": ["start", "stop", "restart", "kill", "watch"],
+                           "description": "'watch' = check/await boot completion after a start/restart (read-only)."},
+                "confirm": {"type": "boolean", "default": False, "description": "Required true to perform start/stop/restart/kill (not needed for watch)."},
                 "force": {"type": "boolean", "default": False, "description": "Required to stop/restart/kill a LIVE server."},
+                "watch": {"type": "boolean", "default": True, "description": "Arm the boot watcher after start/restart."},
+                "wait": {"type": "integer", "default": 0, "description": "action='watch': long-poll up to this many seconds (max 55) for BOOT COMPLETE before returning."},
             },
             "required": ["server", "action"],
         },
@@ -1726,8 +1920,8 @@ TOOLS = [
         "description": ("Run SQL against the game MariaDB (via docker exec; root password stays inside the "
                         "container). SELECT/SHOW/DESCRIBE/EXPLAIN run automatically; INSERT/UPDATE/DELETE/DDL "
                         "require confirm=true (they change LIVE player data). `database` accepts a raw schema "
-                        "name OR any alias defined in db_aliases in config.json. Output is a text table (or "
-                        "format='tsv'), capped ~40KB — add LIMIT for big tables."),
+                        "name OR any alias defined in db_aliases in config.json.%s Output is a text table (or "
+                        "format='tsv'), capped ~40KB — add LIMIT for big tables." % _ALIAS_TXT),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1783,7 +1977,7 @@ def handle(msg):
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": params.get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "srcds-ncg", "version": "1.1.0"},
+            "serverInfo": {"name": "srcds-mcp", "version": "1.2.0"},
         }})
         return
     if method == "notifications/initialized" or method == "initialized":
@@ -1800,6 +1994,16 @@ def handle(msg):
         fn = DISPATCH.get(name)
         if not fn:
             send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown tool: %s" % name}})
+            return
+        # Central config gate: EVERY tool needs SSH, so an unconfigured install
+        # always answers with the actionable "config: ..." message (the README
+        # promises this) instead of a generic "host unreachable".
+        ce = config_error()
+        if ce:
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type": "text", "text": "config: " + ce}],
+                "isError": True,
+            }})
             return
         try:
             text, is_error = fn(args)
