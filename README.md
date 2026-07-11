@@ -164,9 +164,11 @@ Servers commonly run **`-norcon`** (classic Source RCON off) with stdin owned by
 Pterodactyl wings daemon. The reliable control path is: **SSH → `pty.fork(docker
 attach)` injection**. Reading results back differs by channel:
 
-- **`srcds_console`** reads the `-condebug` `console.log`. Only servers launched with
-  `-condebug` echo output back; without it a console command runs "blind" (executes,
-  no echo).
+- **`srcds_console`** reads the `-condebug` `console.log` delta where available;
+  on servers without `-condebug` it captures the reply live off the attached pty
+  during the injection window instead — no server is blind. For console *history*
+  without `-condebug` (or while a server is down), `srcds_fetch what:"docker"`
+  tails the container's docker log.
 - **`srcds_lua`** does **not** depend on `-condebug`. The injected runner `file.Write`s
   its framed output to `data/_mcp/<token>.txt` on the volume, which the host driver
   reads directly off the bind-mounted volume. So **Lua/verification output is captured
@@ -196,8 +198,8 @@ don't hit the Windows ~32 KB command-line limit**.
 | Tool | Gate | What |
 | --- | --- | --- |
 | `srcds_status` | always allowed | up/down, **live player count (A2S)**, LIVE flag vs thresholds, port, condebug |
-| `srcds_fetch` | always allowed | tail `console.log`, read a file (or `save_to` = binary-safe download), list a dir, `sha1` a subtree, or list deploy backups; ANSI stripped, byte-capped |
-| `srcds_console` | confirm if destructive | inject a console command; returns the console.log delta where `-condebug` is on (ANSI-stripped, byte-capped like fetch) |
+| `srcds_fetch` | always allowed | tail `console.log` or the **docker log** (console history, no `-condebug` needed), read a file (or `save_to` = binary-safe download), list a dir, `sha1` a subtree, or list deploy backups; ANSI stripped, byte-capped |
+| `srcds_console` | confirm if destructive | inject a console command; reply captured on every server — console.log delta with `-condebug`, live pty capture without (ANSI-stripped, byte-capped) |
 | `srcds_lua` | confirm if mutating | run server Lua / **multi-line verification suites**; captures output + `return <expr>` with an assertion harness |
 | `srcds_deploy` | confirm | write a local file / inline content to the volume; UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `restore:true` rolls back to the last backup, `.lua` hot-reloads, works even if server DOWN |
 | `srcds_grep` | always allowed | recursive `grep` across the **deployed** volume source (find symbols / local-vs-remote divergence) |
@@ -245,8 +247,9 @@ If the node runs a `mariadb` container, the DB tools query it via `docker exec` 
 read the root password from the container's own `$MYSQL_ROOT_PASSWORD` — **the
 password is never extracted, hardcoded, or logged**. `database` accepts a raw schema
 name or any alias you define in `db_aliases`. Reads run automatically; a write/DDL is
-blocked until `confirm:true`. Output is a text table (or `format:"tsv"`), capped
-~40 KB — add a `LIMIT`.
+blocked until `confirm:true`. Output is **TSV by default** (token-lean for AI
+clients; tabs/newlines in values are escaped) — pass `format:"table"` for a
+bordered table. Capped ~40 KB — add a `LIMIT`.
 
 ---
 

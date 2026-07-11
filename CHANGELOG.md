@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.0 — Console capture everywhere, TSV-default DB output
+No more blind consoles, and DB results stop paying the ASCII-border token tax.
+
+- **`srcds_console` now captures the reply on EVERY server.** Where `-condebug`
+  is on it still diffs `console.log`; without it the reply is captured live off
+  the attached pty during the injection window (previously: "blind write").
+  Both paths are ANSI-stripped and byte-capped.
+- **`srcds_fetch what:"docker"`.** Console output *history* via the container's
+  docker log driver — no `-condebug` needed, and it works even while the server
+  is DOWN (boot/crash forensics; covers the current container's lifetime).
+  Supports `lines` (max 2000), `grep`, `maxbytes`.
+- **DB output defaults to TSV.** `srcds_db_query` / `srcds_db_schema` now return
+  `mariadb --batch` TSV (tabs/newlines escaped) instead of `+---+` bordered
+  tables — the same data at a fraction of the tokens. Pass `format:"table"` for
+  the bordered human-readable form.
+
 ## 1.3.0 — Divergence tooling, rollback, downloads, node health
 Two new tools and two extended ones, aimed at the workflows around the core dev
 loop: comparing deployments, undoing a bad push, and crash forensics.

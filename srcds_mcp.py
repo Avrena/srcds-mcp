@@ -247,33 +247,48 @@ def discover():
         })
     return {"servers": res}
 
-def inject(cid, cmd, lead=1.0, trail=2.0):
+def inject(cid, cmd, lead=1.0, trail=2.0, capture=False):
+    # With capture=True, everything the attached pty prints during the injection
+    # window is collected and returned — the no-`-condebug` output channel.
+    buf = []
+    buflen = [0]
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp("docker", ["docker","attach","--sig-proxy=false","--detach-keys=ctrl-_", cid])
     else:
-        time.sleep(lead)
-        os.write(fd, (cmd + "\n").encode("utf-8"))
-        time.sleep(trail)
+        def pump(duration, until_quiet=False):
+            end = time.time() + duration
+            while time.time() < end:
+                r, _, _ = select.select([fd], [], [], 0.3)
+                if not r:
+                    if until_quiet:
+                        return
+                    continue
+                try:
+                    d = os.read(fd, 8192)
+                except OSError:
+                    return
+                if not d:
+                    return
+                if capture and buflen[0] < 400000:
+                    buf.append(d)
+                    buflen[0] += len(d)
+        pump(lead)
+        try:
+            os.write(fd, (cmd + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        pump(trail)
         try:
             os.write(fd, b"\x1f")  # ctrl-_ detach
         except OSError:
             pass
-        time.sleep(0.4)
-        try:
-            while True:
-                r, _, _ = select.select([fd], [], [], 0.3)
-                if not r:
-                    break
-                d = os.read(fd, 4096)
-                if not d:
-                    break
-        except OSError:
-            pass
+        pump(3.0, until_quiet=True)   # drain what's left, stop on first quiet gap
         try:
             os.waitpid(pid, 0)
         except OSError:
             pass
+    return b"".join(buf).decode("utf-8", "replace") if capture else ""
 
 def file_size(p):
     try:
@@ -300,29 +315,36 @@ def op_console(req):
     cid = ps[u]
     condebug = os.path.isfile(log)
     before = file_size(log) if condebug else None
-    inject(cid, req["cmd"], req.get("lead", 1.0), req.get("trail", 2.5))
-    out = ""
-    truncated = False
+    # Without -condebug there is no console.log to diff, so capture the reply
+    # straight off the attached pty instead (works on every server).
+    cap = inject(cid, req["cmd"], req.get("lead", 1.0), req.get("trail", 2.5),
+                 capture=not condebug)
     if condebug and before is not None:
         out = read_delta(log, before)
-        pat = req.get("grep")
-        if pat:
-            out = "\n".join(l for l in out.splitlines() if pat in l)
-        # Strip ANSI color noise FIRST (on chatty servers it can be a third of the
-        # bytes), then byte-cap what the client actually has to read. Keep the
-        # most-recent (end) slice, same policy as op_fetch.
-        out = _ANSI_RE.sub("", out)
-        maxb = int(req.get("maxbytes", 24000))
-        orig = len(out)
-        truncated = orig > maxb
-        if truncated:
-            out = out[orig - maxb:]
-            nl = out.find("\n")            # drop the leading partial line for cleanliness
-            if 0 <= nl < 240:
-                out = out[nl + 1:]
-            out = "...[truncated: last %d of %d chars]...\n%s" % (len(out), orig, out)
+    else:
+        out = cap.replace("\r\n", "\n").replace("\r", "\n")
+        # drop the docker-attach detach notice, not server output
+        out = "\n".join(l for l in out.splitlines() if l.strip() != "read escape sequence")
+    pat = req.get("grep")
+    if pat:
+        out = "\n".join(l for l in out.splitlines() if pat in l)
+    # Strip ANSI color noise FIRST (on chatty servers it can be a third of the
+    # bytes), then byte-cap what the client actually has to read. Keep the
+    # most-recent (end) slice, same policy as op_fetch.
+    out = _ANSI_RE.sub("", out)
+    maxb = int(req.get("maxbytes", 24000))
+    orig = len(out)
+    truncated = orig > maxb
+    if truncated:
+        out = out[orig - maxb:]
+        nl = out.find("\n")            # drop the leading partial line for cleanliness
+        if 0 <= nl < 240:
+            out = out[nl + 1:]
+        out = "...[truncated: last %d of %d chars]...\n%s" % (len(out), orig, out)
     return {"ok": True, "running": True, "condebug": condebug, "output": out, "truncated": truncated,
-            "note": ("" if condebug else "no -condebug: command injected but output not captured (blind write)")}
+            "note": ("" if condebug else
+                     "no -condebug: reply captured live from the attached console pty; "
+                     "only output inside the ~%.0fs injection window is included" % (req.get("trail", 2.5) + 3))}
 
 def op_lua(req):
     body = req.get("body"); runner = req.get("runner"); tok = req.get("token")
@@ -532,6 +554,32 @@ def op_fetch(req):
             if capped:
                 break
         return {"ok": True, "backups": out, "truncated": capped}
+
+    if what == "docker":
+        # Console output history via the docker log driver — works WITHOUT
+        # -condebug and even while the server is down (covers the current
+        # container's lifetime; wings recreates the container on install/boot).
+        n = max(1, min(lines, 2000))
+        try:
+            r = subprocess.run(["docker", "logs", "--tail", str(n), u],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        except Exception as e:
+            return {"ok": False, "error": "docker logs failed: %s" % e}
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        if r.returncode != 0:
+            return {"ok": False, "error": "docker logs rc=%d: %s" % (r.returncode, out[-300:])}
+        out = out.replace("\r\n", "\n").replace("\r", "\n")
+        pat = req.get("grep")
+        if pat:
+            out = "\n".join(l for l in out.splitlines() if pat in l)
+        out = _ANSI_RE.sub("", out)
+        maxb = int(req.get("maxbytes", 48000))
+        orig = len(out)
+        truncated = orig > maxb
+        if truncated:
+            out = "...[truncated: last %d of %d chars]...\n%s" % (maxb, orig, out[orig - maxb:])
+        return {"ok": True, "path": "docker logs %s (tail %d)" % (u[:8], n),
+                "content": out, "truncated": truncated}
 
     if what == "console":
         p = gm + "/console.log"
@@ -1355,7 +1403,8 @@ def tool_console(args):
         head += "  [byte-capped -> most recent; raise maxbytes or narrow with grep]"
     if note:
         head += "\n(note: %s)" % note
-    return (head + "\n--- console.log delta ---\n" + out, False)
+    src = "console.log delta" if res.get("condebug") else "pty capture"
+    return (head + "\n--- %s ---\n" % src + out, False)
 
 
 # Safe value -> single-line JSON-ish text. Cycle/entity/depth/fanout/length-safe.
@@ -2120,7 +2169,7 @@ def tool_db_query(args):
                 "player/server data. Re-call with confirm=true to run it. Nothing was executed."
                 % (reason, database or "?"), True)
     res = run_driver({"op": "db", "sql": sql, "database": database,
-                      "format": args.get("format", "table")}, timeout=60)
+                      "format": args.get("format", "tsv")}, timeout=60)
     log_event({"ev": "db_query", "database": database, "write": bool(reason),
                "confirm": bool(args.get("confirm")), "sql": sql[:200], "ok": res.get("ok")})
     if not res.get("ok"):
@@ -2138,6 +2187,7 @@ def tool_db_schema(args):
     table = args.get("table")
     if database and not _db_name_ok(database):
         return ("invalid database name", True)
+    fmt = args.get("format", "tsv")
     if not database:
         sql = "SHOW DATABASES;"
     elif not table:
@@ -2148,7 +2198,7 @@ def tool_db_schema(args):
         if not _db_name_ok(table):
             return ("invalid table name", True)
         sql = "DESCRIBE `%s`.`%s`; SHOW INDEX FROM `%s`.`%s`;" % (database, table, database, table)
-    res = run_driver({"op": "db", "sql": sql, "format": "table"}, timeout=30)
+    res = run_driver({"op": "db", "sql": sql, "format": fmt}, timeout=30)
     log_event({"ev": "db_schema", "database": database, "table": table, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("db schema failed: %s" % (res.get("error_out") or res.get("error")), True)
@@ -2180,13 +2230,13 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only volume access, always allowed. what='console': tail console.log (only -condebug servers have one — srcds_status shows which). what='file': read a file; add save_to=<local path> for a binary-safe download (crash dumps, .db). what='dir': list a directory (sizes+mtimes). what='hash': sha1 every file under a path — compare two servers' listings to spot divergence, then srcds_diff the files that differ. what='backups': list deploy backups (restore via srcds_deploy restore:true).",
+        "description": "Read-only volume/console access, always allowed. what='console': tail console.log (-condebug servers only). what='docker': tail the container's docker log — console history WITHOUT -condebug, works even while the server is DOWN (crash forensics; covers the current container lifetime). what='file': read a file; add save_to=<local path> for a binary-safe download (crash dumps, .db). what='dir': list a directory (sizes+mtimes). what='hash': sha1 every file under a path — compare two servers' listings to spot divergence, then srcds_diff the files that differ. what='backups': list deploy backups (restore via srcds_deploy restore:true).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups"], "default": "console"},
-                "lines": {"type": "integer", "default": 200, "description": "what='console': tail this many lines."},
+                "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups", "docker"], "default": "console"},
+                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (docker max 2000)."},
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
                 "grep": {"type": "string", "description": "Optional substring filter (console/file)."},
@@ -2199,7 +2249,7 @@ TOOLS = [
     },
     {
         "name": "srcds_console",
-        "description": "Inject a server console command via the pty/docker-attach path (works on -norcon servers). Where -condebug is on, the console.log delta is returned (ANSI-stripped, byte-capped); otherwise the command runs blind. Destructive commands (kick/ban/changelevel/map/password/restart/...) require confirm=true.",
+        "description": "Inject a server console command via the pty/docker-attach path (works on -norcon servers). The reply is captured on EVERY server: from the console.log delta where -condebug is on, otherwise live off the attached pty (ANSI-stripped and byte-capped either way). Destructive commands (kick/ban/changelevel/map/password/restart/...) require confirm=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2332,14 +2382,16 @@ TOOLS = [
         "description": ("Run SQL against the game MariaDB (via docker exec; root password stays inside the "
                         "container). SELECT/SHOW/DESCRIBE/EXPLAIN run automatically; INSERT/UPDATE/DELETE/DDL "
                         "require confirm=true (they change LIVE player data). `database` accepts a raw schema "
-                        "name OR any alias defined in db_aliases in config.json.%s Output is a text table (or "
-                        "format='tsv'), capped ~40KB — add LIMIT for big tables." % _ALIAS_TXT),
+                        "name OR any alias defined in db_aliases in config.json.%s Output is TSV by default "
+                        "(token-lean; tabs/newlines in values are escaped); format='table' for a bordered "
+                        "human-readable table. Capped ~40KB — add LIMIT for big tables." % _ALIAS_TXT),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "database": {"type": "string", "description": "Raw schema name, or an alias from db_aliases in config.json. Omit for a server-agnostic query (e.g. information_schema)."},
                 "sql": {"type": "string", "description": "The SQL. e.g. \"SELECT * FROM ninv_items WHERE owner='STEAM_0:..' LIMIT 20\"."},
-                "format": {"type": "string", "enum": ["table", "tsv"], "default": "table"},
+                "format": {"type": "string", "enum": ["tsv", "table"], "default": "tsv",
+                           "description": "tsv (default, token-lean) or table (bordered, for humans)."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true for any write/DDL statement."},
             },
             "required": ["sql"],
@@ -2347,12 +2399,13 @@ TOOLS = [
     },
     {
         "name": "srcds_db_schema",
-        "description": "Browse the MariaDB schema (read-only, always allowed): no args → list databases; database only → its tables with approx row counts + sizes; database+table → DESCRIBE columns + indexes. `database` accepts the same aliases as srcds_db_query.",
+        "description": "Browse the MariaDB schema (read-only, always allowed): no args → list databases; database only → its tables with approx row counts + sizes; database+table → DESCRIBE columns + indexes. `database` accepts the same aliases as srcds_db_query. TSV output by default.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "database": {"type": "string", "description": "Schema name or server alias. Omit to list all databases."},
                 "table": {"type": "string", "description": "Table name to describe (columns + indexes)."},
+                "format": {"type": "string", "enum": ["tsv", "table"], "default": "tsv"},
             },
         },
     },
@@ -2391,7 +2444,7 @@ def handle(msg):
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": params.get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "srcds-mcp", "version": "1.3.0"},
+            "serverInfo": {"name": "srcds-mcp", "version": "1.4.0"},
         }})
         return
     if method == "notifications/initialized" or method == "initialized":
