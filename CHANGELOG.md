@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.0 — Batch deploy, output budgets everywhere
+Deploy a whole addon in one call; no tool can flood the context anymore.
+
+- **`srcds_deploy` batch mode.** `files:[{to, local|content}, ...]` (max 400)
+  writes many files in ONE call — one confirm, one SSH round-trip, per-file
+  report. Every path is validated before anything is written (a typo can't
+  half-apply a batch); after that writes are best-effort with failures
+  itemized. `restore:true` with `files` rolls the whole batch back (backups
+  stay per-file). Duplicate `to` entries are rejected — the second write would
+  back up the batch's own first write and destroy the pre-deploy backup.
+- **Token-lean batch report.** An all-OK batch returns ONE summary line
+  (counts + bytes) instead of echoing the file list back; only failures are
+  itemized (capped at 25).
+- **Anti-trickle nudge.** Deploying 3+ distinct files one-by-one to the same
+  server within a few minutes appends a TIP steering toward batch mode.
+  Advisory only — re-deploying the SAME file (a dev loop) never trips it.
+- **`srcds_lua` output budgets.** OUT is now capped by lines AND bytes
+  (400 / 32 KB); FAIL detail at 60 lines / 24 KB — a failing check inside a
+  loop used to emit one line per iteration (potentially megabytes). The
+  `p=/f=` summary still counts every check; `[note]` lines mark any cut.
+- **`srcds_fetch what:"hash"` byte cap.** The listing is budgeted at 48 KB
+  with an explicit `[N of M entries omitted]` notice (was up to ~150 KB).
+
 ## 1.4.0 — Console capture everywhere, TSV-default DB output
 No more blind consoles, and DB results stop paying the ASCII-border token tax.
 

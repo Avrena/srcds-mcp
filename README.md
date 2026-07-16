@@ -201,7 +201,7 @@ don't hit the Windows ~32 KB command-line limit**.
 | `srcds_fetch` | always allowed | tail `console.log` or the **docker log** (console history, no `-condebug` needed), read a file (or `save_to` = binary-safe download), list a dir, `sha1` a subtree, or list deploy backups; ANSI stripped, byte-capped |
 | `srcds_console` | confirm if destructive | inject a console command; reply captured on every server — console.log delta with `-condebug`, live pty capture without (ANSI-stripped, byte-capped) |
 | `srcds_lua` | confirm if mutating | run server Lua / **multi-line verification suites**; captures output + `return <expr>` with an assertion harness |
-| `srcds_deploy` | confirm | write a local file / inline content to the volume; UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `restore:true` rolls back to the last backup, `.lua` hot-reloads, works even if server DOWN |
+| `srcds_deploy` | confirm | write files to the volume — single (`to` + `local`/`content`) or **batch** (`files:[{to, local\|content}, …]`: one confirm, one SSH round-trip, per-file report; batch `restore:true` rolls it all back); UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `.lua` hot-reloads, works even if server DOWN |
 | `srcds_grep` | always allowed | recursive `grep` across the **deployed** volume source (find symbols / local-vs-remote divergence) |
 | `srcds_diff` | always allowed | unified diff of a deployed file vs another server's copy or vs a **local** file — divergence checks before deploying |
 | `srcds_nodeinfo` | always allowed | host health: load, memory, disk, docker stats; optional wings-log / dmesg tails for crash & OOM forensics |
@@ -221,6 +221,7 @@ server that's off) — and `srcds_deploy {restore:true}` if the push went wrong.
 - `srcds_console {server:"scprp", command:"status", grep:"players"}`.
 - `srcds_fetch {server:"scprp", what:"file", path:"cfg/server.cfg"}`.
 - `srcds_deploy {server:"scprp", to:"addons/x/lua/autorun/server/y.lua", local:"C:/.../y.lua", confirm:true}`.
+- `srcds_deploy {server:"scprp", files:[{to:"addons/x/a.lua", local:"C:/.../a.lua"}, {to:"addons/x/b.lua", content:"..."}], confirm:true}` — batch: many files, one call.
 
 *(`scprp` here is just whatever you named a server in `config.json` → `servers`.)*
 

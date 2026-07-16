@@ -645,47 +645,16 @@ def _safe_under(gm, rel):
         return p
     return None
 
-def op_deploy(req):
-    u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
-    p = _safe_under(gm, req["to"])
+def _deploy_write(u, gm, to, data, backup=True):
+    p = _safe_under(gm, to)
     if not p:
-        return {"ok": False, "error": "path escapes volume"}
-    if req.get("restore"):
-        # Roll back to the last deploy backup. Deliberately does NOT re-backup the
-        # current (bad) file first — that would overwrite the good backup and make
-        # a second restore impossible. The backup is kept as-is.
-        bak = BAKROOT + "/" + u + "/" + req["to"].lstrip("/")
-        if not os.path.isfile(bak):
-            return {"ok": False, "error": "no deploy backup recorded for %s" % req["to"]}
-        try:
-            with open(bak, "rb") as f:
-                data = f.read()
-            d = os.path.dirname(p)
-            if d and not os.path.isdir(d):
-                os.makedirs(d, exist_ok=True)
-            with open(p, "wb") as f:
-                f.write(data)
-            try:
-                os.chmod(p, 0o644)
-            except OSError:
-                pass
-            try:
-                os.chown(p, OWNER_UID, OWNER_GID)
-            except (OSError, AttributeError):
-                pass
-        except OSError as e:
-            return {"ok": False, "error": "restore failed: %s" % e}
-        return {"ok": True, "restored": True, "path": p, "bytes": len(data), "backup": bak}
-    try:
-        data = base64.b64decode(req["content_b64"])
-    except Exception as e:
-        return {"ok": False, "error": "bad content: %s" % e}
+        return {"ok": False, "to": to, "error": "path escapes volume"}
     existed = os.path.isfile(p)
     bak = None
-    if existed and req.get("backup", True):
+    if existed and backup:
         # mirror the path under a dedicated backups root so we NEVER drop .mcpbak files
         # into addon/source/git trees. One latest backup per (server, path), overwritten.
-        bak = BAKROOT + "/" + u + "/" + req["to"].lstrip("/")
+        bak = BAKROOT + "/" + u + "/" + to.lstrip("/")
         try:
             os.makedirs(os.path.dirname(bak), exist_ok=True)
             with open(p, "rb") as f:
@@ -693,7 +662,7 @@ def op_deploy(req):
             with open(bak, "wb") as f:
                 f.write(old)
         except OSError as e:
-            return {"ok": False, "error": "backup failed: %s" % e}
+            return {"ok": False, "to": to, "error": "backup failed: %s" % e}
     try:
         d = os.path.dirname(p)
         if d and not os.path.isdir(d):
@@ -709,8 +678,70 @@ def op_deploy(req):
         except (OSError, AttributeError):
             pass
     except OSError as e:
-        return {"ok": False, "error": "write failed: %s" % e}
-    return {"ok": True, "path": p, "bytes": len(data), "overwrote": existed, "backup": bak}
+        return {"ok": False, "to": to, "error": "write failed: %s" % e}
+    return {"ok": True, "to": to, "path": p, "bytes": len(data), "overwrote": existed, "backup": bak}
+
+def _restore_one(u, gm, to):
+    # Roll back to the last deploy backup. Deliberately does NOT re-backup the
+    # current (bad) file first — that would overwrite the good backup and make
+    # a second restore impossible. The backup is kept as-is.
+    if not _safe_under(gm, to):
+        return {"ok": False, "to": to, "error": "path escapes volume"}
+    bak = BAKROOT + "/" + u + "/" + to.lstrip("/")
+    if not os.path.isfile(bak):
+        return {"ok": False, "to": to, "error": "no deploy backup recorded for %s" % to}
+    try:
+        with open(bak, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return {"ok": False, "to": to, "error": "restore failed: %s" % e}
+    r = _deploy_write(u, gm, to, data, backup=False)
+    if r.get("ok"):
+        r["restored"] = True
+        r["backup"] = bak
+    return r
+
+def op_deploy(req):
+    u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
+    files = req.get("files")
+    if files is not None:
+        # Batch: refuse the whole batch up front if ANY path escapes (a typo must
+        # not yield a half-applied deploy), then write best-effort with a per-file
+        # report so one bad file doesn't abort the rest.
+        for f in files:
+            if not _safe_under(gm, f.get("to") or ""):
+                return {"ok": False, "error": "path escapes volume: %s" % f.get("to")}
+        results = []
+        for f in files:
+            if req.get("restore"):
+                results.append(_restore_one(u, gm, f["to"]))
+                continue
+            try:
+                data = base64.b64decode(f["content_b64"])
+            except Exception as e:
+                results.append({"ok": False, "to": f.get("to"), "error": "bad content: %s" % e})
+                continue
+            results.append(_deploy_write(u, gm, f["to"], data, req.get("backup", True)))
+        n_ok = sum(1 for r in results if r.get("ok"))
+        return {"ok": True, "batch": True, "results": results,
+                "n_ok": n_ok, "n_fail": len(results) - n_ok,
+                "bytes": sum(r.get("bytes", 0) for r in results if r.get("ok"))}
+    p = _safe_under(gm, req["to"])
+    if not p:
+        return {"ok": False, "error": "path escapes volume"}
+    if req.get("restore"):
+        r = _restore_one(u, gm, req["to"])
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error")}
+        return r
+    try:
+        data = base64.b64decode(req["content_b64"])
+    except Exception as e:
+        return {"ok": False, "error": "bad content: %s" % e}
+    r = _deploy_write(u, gm, req["to"], data, req.get("backup", True))
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error")}
+    return r
 
 def op_grep(req):
     u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
@@ -1523,16 +1554,25 @@ end
 
 @SER@
 
-local _outn = 0
+-- OUT is budgeted by lines AND bytes: 400 short lines is fine, but 400 x 1400-char
+-- lines would be ~560KB of tokens. First cap crossed wins; a NOTE marks the cut.
+local _outn, _outb, _outcap = 0, 0, false
 local function _LOGLINE(s)
   s = tostring(s)
   if #s > 1400 then s = s:sub(1, 1400) .. "...<+>" end
+  if _outcap then return end
   _outn = _outn + 1
-  if _outn <= 400 then _emit("OUT", s)
-  elseif _outn == 401 then _emit("NOTE", "output capped at 400 lines") end
+  _outb = _outb + #s
+  if _outn > 400 or _outb > 32768 then
+    _outcap = true
+    _emit("NOTE", "output capped (>400 lines or >32KB) - further lines dropped")
+    return
+  end
+  _emit("OUT", s)
 end
 
 local _P, _F = 0, 0
+local _fb, _fcap = 0, false
 local _section = ""
 local _HNAMES = { "SECTION","CHECK","EQ","NEQ","NEAR","TRUE","FALSE","OK","THROWS","DUMP","LOG","MCP_DONE" }
 local _saved = {}
@@ -1542,10 +1582,21 @@ local function _tag(m) if _section ~= "" then return "[" .. _section .. "] " .. 
 local function _record(pass, failtext)
   if pass then _P = _P + 1
   else
+    -- FAIL detail is budgeted (a failing check inside a loop would otherwise emit
+    -- one line per iteration - megabytes). _F keeps counting so the p=/f= summary
+    -- stays exact even when detail is suppressed.
     _F = _F + 1
     local ft = (tostring(failtext):gsub("[\r\n]+", " / "))
     if #ft > 1400 then ft = ft:sub(1, 1400) .. "...<+>" end
-    _emit("FAIL", ft)
+    if not _fcap then
+      _fb = _fb + #ft
+      if _F > 60 or _fb > 24576 then
+        _fcap = true
+        _emit("NOTE", "FAIL details capped (>60 fails or >24KB) - the p=/f= summary still counts ALL checks")
+      else
+        _emit("FAIL", ft)
+      end
+    end
   end
   return pass
 end
@@ -1710,11 +1761,16 @@ def tool_lua(args):
         parts.append("(note: %s)" % note)
     if summ:
         parts.append("checks: %s%s" % (summ, "" if nf == 0 else "   <-- FAILURES"))
-        for fl in fails:
+        for fl in fails[:60]:
             parts.append("  [FAIL] " + fl)
+        if len(fails) > 60:
+            parts.append("  ...[%d more FAIL lines suppressed — the f= count above is exact]" % (len(fails) - 60))
     if err is not None:
         parts.append("--- ERROR ---\n" + err)
     if out:
+        # backstop only — the runner already budgets OUT (400 lines / 32KB)
+        if len(out) > 60000:
+            out = "...[capped: last 60000 of %d chars]...\n%s" % (len(out), out[-60000:])
         parts.append("--- output ---\n" + out)
     if ret is not None:
         parts.append("--- return ---\n" + ret)
@@ -1767,9 +1823,19 @@ def tool_fetch(args):
                 server.upper(), args.get("path", ""), args.get("glob") or "*",
                 res.get("count", len(files)),
                 "  [capped at 2000 — narrow path/glob]" if res.get("truncated") else "")]
+            # byte-budget the listing (2000 entries would be ~150KB of tokens)
+            used, omitted = 0, 0
             for rel in sorted(files):
                 h, sz = files[rel]
-                out.append("  %s %9s  %s" % (h or "?" * 12, sz, rel))
+                line = "  %s %9s  %s" % (h or "?" * 12, sz, rel)
+                if used + len(line) > 48000:
+                    omitted += 1
+                    continue
+                used += len(line) + 1
+                out.append(line)
+            if omitted:
+                out.append("  ...[%d of %d entries omitted at 48KB — narrow path/glob for a complete compare]"
+                           % (omitted, len(files)))
             return ("\n".join(out), False)
         baks = res.get("backups", [])
         out = ["[%s] deploy backups (latest per path; roll back via srcds_deploy restore:true) — %d%s" % (
@@ -1822,12 +1888,132 @@ def tool_fetch(args):
 PANEL_URL = CFG.get("panel_url") or ""
 
 
+DEPLOY_BATCH_MAX = 400          # sanity cap; a whole addon fits comfortably
+
+# Anti-trickle nudge: an LLM that uploads N files as N single-file calls burns a
+# confirm + an SSH round-trip per file. Count DISTINCT paths single-deployed per
+# server in a sliding window and, past the threshold, tell it to batch. Advisory
+# only — never blocks (re-deploying the SAME file repeatedly is a legit dev loop
+# and doesn't trip this, since distinct paths are what's counted).
+SINGLE_TRICKLE_WINDOW = 240.0   # seconds
+SINGLE_TRICKLE_AT = 3           # distinct files before the nudge fires
+_recent_singles = {}            # server -> {to: last_deploy_time}
+
+
+def _trickle_note(server, to, record):
+    now = time.time()
+    h = _recent_singles.setdefault(server, {})
+    for k in [k for k, t in h.items() if now - t >= SINGLE_TRICKLE_WINDOW]:
+        del h[k]
+    if record:
+        h[to] = now
+    n = len(h) + (0 if (record or to in h) else 1)
+    if n >= SINGLE_TRICKLE_AT:
+        return ("\nTIP: %d different files deployed one-by-one to %s in the last %d min — send multiple files "
+                "as ONE call: files:[{to, local|content}, ...] (one confirm, one SSH round-trip)."
+                % (n, server, int(SINGLE_TRICKLE_WINDOW // 60)))
+    return ""
+
+
+def _bad_deploy_to(to):
+    return (not to) or to.startswith("/") or ":" in to or ".." in to.replace("\\", "/").split("/")
+
+
+def _deploy_batch(server, srv, args, files):
+    if args.get("to") or args.get("local") or ("content" in args):
+        return ("give EITHER 'files' (batch) OR top-level to/local/content (single), not both.", True)
+    if not isinstance(files, list) or not files:
+        return ("'files' must be a non-empty array of {to, local|content} objects.", True)
+    if len(files) > DEPLOY_BATCH_MAX:
+        return ("batch too large: %d files (max %d). Split into several calls." % (len(files), DEPLOY_BATCH_MAX), True)
+    restore = args.get("restore") is True
+    entries, seen = [], set()
+    for i, f in enumerate(files):
+        if not isinstance(f, dict):
+            return ("files[%d] is not an object." % i, True)
+        to = (f.get("to") or "").strip()
+        if _bad_deploy_to(to):
+            return ("files[%d]: invalid 'to' (%r): give a path relative to garrysmod/ with no '..' or drive/absolute prefix." % (i, f.get("to")), True)
+        key = to.replace("\\", "/")
+        if key in seen:
+            # a duplicate would make the 2nd write back up the batch's own 1st
+            # write, silently destroying the pre-deploy backup for that path
+            return ("files[%d]: duplicate 'to' %s — each path may appear only once per batch." % (i, to), True)
+        seen.add(key)
+        if restore:
+            entries.append({"to": to})
+            continue
+        has_local = bool(f.get("local")); has_content = "content" in f
+        if has_local == has_content:
+            return ("files[%d] (%s): provide exactly one of 'local' or 'content'." % (i, to), True)
+        if has_local:
+            try:
+                with open(f["local"], "rb") as fh:
+                    data = fh.read()
+            except OSError as e:
+                return ("files[%d] (%s): could not read local file: %s. Nothing was deployed." % (i, to, e), True)
+        else:
+            data = (f["content"] or "").encode("utf-8")
+        entries.append({"to": to, "content_b64": base64.b64encode(data).decode(), "bytes": len(data)})
+    total = sum(e.get("bytes", 0) for e in entries)
+    if args.get("confirm") is not True:
+        players, maxpl, is_live = live_info(srv)
+        ln = ("  (%d/%s players%s)" % (players, maxpl, " — LIVE" if is_live else "")) if players is not None else ""
+        head = (("BLOCKED: batch-restore %d files on %s from their deploy backups.%s" % (len(entries), server, ln))
+                if restore else
+                ("BLOCKED: batch-deploy %d files (%d bytes total) -> %s:garrysmod/.%s" % (len(entries), total, server, ln)))
+        listing = "\n".join("  " + e["to"] for e in entries[:12])
+        if len(entries) > 12:
+            listing += "\n  ...and %d more" % (len(entries) - 12)
+        return ("%s Re-call with confirm=true. Nothing was written.\n%s" % (head, listing), True)
+    req = {"op": "deploy", "uuid": srv["uuid"], "backup": args.get("backup", True),
+           "files": [{k: e[k] for k in ("to", "content_b64") if k in e} for e in entries]}
+    if restore:
+        req["restore"] = True
+    res = run_driver(req, timeout=min(240, 60 + 2 * len(entries)))
+    log_event({"ev": "deploy_batch", "server": server, "files": len(entries), "bytes": total,
+               "restore": restore, "ok": res.get("ok"), "n_fail": res.get("n_fail")})
+    if not res.get("ok"):
+        return ("batch deploy failed: %s" % res.get("error"), True)
+    results = res.get("results") or []
+    n_ok, n_fail = res.get("n_ok", 0), res.get("n_fail", 0)
+    # Token-lean output: the caller already knows the file list it sent, so a clean
+    # batch gets ONE summary line; only failures are itemized (those are news).
+    n_over = sum(1 for r in results if r.get("ok") and r.get("overwrote"))
+    n_bak = sum(1 for r in results if r.get("ok") and r.get("backup"))
+    if restore:
+        verb, detail = "batch-RESTORED", "backups kept, restoring again stays possible"
+    else:
+        verb = "batch-deployed"
+        detail = "%d overwrote (%d backed up), %d new" % (n_over, n_bak, n_ok - n_over)
+    msg = "[%s] %s %d/%d files, %dB total — %s" % (
+        server.upper(), verb, n_ok, len(results), res.get("bytes", 0), detail)
+    fails = ["  FAILED  %s — %s" % (r.get("to"), r.get("error")) for r in results if not r.get("ok")]
+    if fails:
+        if len(fails) > 25:
+            fails = fails[:25] + ["  ...and %d more FAILED" % (len(fails) - 25)]
+        msg += "\n" + "\n".join(fails)
+        if n_ok:
+            msg += "\n(the %d OK files ARE written — fix and re-send only the failed ones)" % n_ok
+    if not srv.get("running"):
+        msg += "\n(server is DOWN — loads on next boot)"
+    elif any(r.get("ok") and (r.get("to") or "").endswith(".lua") for r in results):
+        msg += "\n(.lua — autorefresh reloads in ~2s; verify with srcds_lua)"
+    _recent_singles.pop(server, None)   # they batched — reset the trickle nudge
+    return (msg, n_fail > 0)
+
+
 def tool_deploy(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
+    if args.get("files") is not None:
+        srv = resolve(server)
+        if not srv:
+            return ("could not resolve server '%s' (host unreachable?)" % server, True)
+        return _deploy_batch(server, srv, args, args.get("files"))
     to = (args.get("to") or "").strip()
-    if not to or to.startswith("/") or ":" in to or ".." in to.replace("\\", "/").split("/"):
+    if _bad_deploy_to(to):
         return ("invalid 'to': give a path relative to garrysmod/ with no '..' or drive/absolute prefix.", True)
     srv = resolve(server)
     if not srv:
@@ -1858,8 +2044,8 @@ def tool_deploy(args):
     if args.get("confirm") is not True:
         players, maxpl, is_live = live_info(srv)
         ln = ("  (%d/%s players%s)" % (players, maxpl, " — LIVE" if is_live else "")) if players is not None else ""
-        return ("BLOCKED: deploy %d bytes -> %s:garrysmod/%s%s. Re-call with confirm=true. Nothing was written."
-                % (len(data), server, to, ln), True)
+        return ("BLOCKED: deploy %d bytes -> %s:garrysmod/%s%s. Re-call with confirm=true. Nothing was written.%s"
+                % (len(data), server, to, ln, _trickle_note(server, to, record=False)), True)
     res = run_driver({"op": "deploy", "uuid": srv["uuid"], "to": to,
                       "content_b64": base64.b64encode(data).decode(),
                       "backup": args.get("backup", True)}, timeout=45)
@@ -1877,6 +2063,7 @@ def tool_deploy(args):
         msg += "\n(server is DOWN — loads on next boot)"
     elif to.endswith(".lua"):
         msg += "\n(.lua — autorefresh reloads it in ~2s; verify with srcds_lua)"
+    msg += _trickle_note(server, to, record=True)
     return (msg, False)
 
 
@@ -2289,19 +2476,23 @@ TOOLS = [
     },
     {
         "name": "srcds_deploy",
-        "description": "Write a file to a server's volume (deploy an addon .lua, cfg, etc.). Provide 'local' (a local file path to copy) OR 'content' (inline string). Path 'to' is relative to garrysmod/ (no '..'/absolute). UTF-8/CJK-safe (driver write, not scp). Backs up an overwritten file to an out-of-tree backups root by default (never drops backup files into source/addon/git trees). restore:true ROLLS BACK 'to' to its last deploy backup (list them via srcds_fetch what='backups'). .lua files hot-reload via autorefresh. Works even if the server is DOWN (loads on boot). Requires confirm=true.",
+        "description": "Write files to a server's volume (deploy addon .lua, cfg, etc.). SINGLE: 'to' + ('local' file path OR 'content' inline string). BATCH: 'files' = [{to, local|content}, ...] pushes many files in ONE call — one confirm, one SSH round-trip, per-file result report (use it whenever deploying >1 file). Paths relative to garrysmod/ (no '..'/absolute). UTF-8/CJK-safe (driver write, not scp). Overwritten files are backed up to an out-of-tree backups root by default (never drops backup files into source/addon/git trees). restore:true ROLLS BACK to the last deploy backup — single 'to' or every files[].to (list backups via srcds_fetch what='backups'). .lua files hot-reload via autorefresh. Works even if the server is DOWN (loads on boot). Requires confirm=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "to": {"type": "string", "description": "Destination path relative to garrysmod/, e.g. 'addons/rals/lua/autorun/server/x.lua' or 'cfg/foo.cfg'."},
-                "local": {"type": "string", "description": "A local file path to read and copy (preferred for real files)."},
-                "content": {"type": "string", "description": "Inline file content (use instead of 'local' for small/generated files)."},
-                "restore": {"type": "boolean", "default": False, "description": "Roll back 'to' to its last deploy backup instead of writing new content (local/content ignored; the backup is kept)."},
-                "backup": {"type": "boolean", "default": True, "description": "Back up an overwritten file to the out-of-tree backups root, not next to the file."},
+                "to": {"type": "string", "description": "SINGLE mode: destination path relative to garrysmod/, e.g. 'addons/rals/lua/autorun/server/x.lua' or 'cfg/foo.cfg'."},
+                "local": {"type": "string", "description": "SINGLE mode: a local file path to read and copy (preferred for real files)."},
+                "content": {"type": "string", "description": "SINGLE mode: inline file content (use instead of 'local' for small/generated files)."},
+                "files": {"type": "array", "description": "BATCH mode: array of {to, local|content} objects (same semantics as the top-level params; each 'to' unique, max 400 per call). With restore:true items need only 'to'. Mutually exclusive with top-level to/local/content.",
+                          "items": {"type": "object",
+                                    "properties": {"to": {"type": "string"}, "local": {"type": "string"}, "content": {"type": "string"}},
+                                    "required": ["to"]}},
+                "restore": {"type": "boolean", "default": False, "description": "Roll back 'to' (or every files[].to) to its last deploy backup instead of writing new content (local/content ignored; the backup is kept)."},
+                "backup": {"type": "boolean", "default": True, "description": "Back up overwritten files to the out-of-tree backups root, not next to the file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true to actually write."},
             },
-            "required": ["server", "to"],
+            "required": ["server"],
         },
     },
     {
@@ -2444,7 +2635,7 @@ def handle(msg):
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": params.get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "srcds-mcp", "version": "1.4.0"},
+            "serverInfo": {"name": "srcds-mcp", "version": "1.5.0"},
         }})
         return
     if method == "notifications/initialized" or method == "initialized":
