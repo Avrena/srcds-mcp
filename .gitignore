@@ -10,7 +10,13 @@ config*.json
 
 # Runtime logs (JSONL trace of every tool call; one per config in multi-node).
 *.log
+*.log.*
 
 # Python bytecode cache.
 __pycache__/
 *.pyc
+
+# Local upgrade and editor backups.
+upgrade-backups/
+*.bak
+*.bak-*

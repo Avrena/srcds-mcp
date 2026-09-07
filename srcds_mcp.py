@@ -13,15 +13,40 @@ on stdin/stdout.
 
 Tools: srcds_status, srcds_fetch, srcds_console, srcds_lua, srcds_deploy,
 srcds_grep, srcds_diff, srcds_nodeinfo, srcds_clientlua, srcds_power,
-srcds_db_query, srcds_db_schema. Server names come from config.json (`servers[]`).
+srcds_monitor, srcds_db_query, srcds_db_schema, srcds_mongo_query,
+srcds_mongo_schema. Server names come from config.json (`servers[]`).
 
-Safety: reads are always allowed; writes that look destructive/mutating require
-confirm=true. Every call is logged to srcds_mcp.log next to this file.
+Safety: structured reads are allowed; arbitrary code and state-changing/local-
+write operations require explicit confirmation. Audit logs redact payload text
+and rotate beside the selected config file.
 """
 
 import sys, os, json, base64, subprocess, socket, struct, re, time, traceback, hashlib
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+MCP_VERSION = "2.0.0"
+import uuid as _uuid
+_CLIENT_INSTANCE = _uuid.uuid4().hex
+MCP_PROTOCOL_VERSION = "2025-11-25"
+MCP_SUPPORTED_PROTOCOLS = (
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+)
+
+CLIENTLUA_MAX_BYTES = 64 * 1024
+CLIENTLUA_ACK_TIMEOUT = 15
+CLIENTLUA_MAX_RECIPIENTS = 128
+DIFF_FILE_MAX_BYTES = 16 * 1024 * 1024
+DIFF_BATCH_MAX_INPUT_BYTES = 64 * 1024 * 1024
+DEPLOY_FILE_MAX_BYTES = 64 * 1024 * 1024
+DEPLOY_BATCH_MAX_INPUT_BYTES = 256 * 1024 * 1024
+GREP_MAX_PATTERNS = 20
+GREP_MAX_GLOBS = 50
+GREP_MAX_PATHS = 25
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+LOG_ROTATE_KEEP = 3
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -57,17 +82,22 @@ DEFAULTS = {
     "owner_gid": 987,
     "panel_url": "",                        # your Pterodactyl panel URL (shown in power errors)
     # Player count at/above which a server is "LIVE" (destructive actions warn louder).
-    "live_thresholds": {"scprp": 50, "drp": 20, "zcity": 3},
+    "live_thresholds": {"game": 1},
     # Server topology: a marker dir under garrysmod/ -> logical name. First match wins.
     # Point these at whatever uniquely identifies each of YOUR gamemodes/servers.
-    "servers": [
-        {"logical": "scprp", "marker": "addons/example-scp-addon"},
-        {"logical": "zcity", "marker": "addons/example-city-addon"},
-        {"logical": "drp",   "marker": "gamemodes/darkrp"},
-    ],
+    "servers": [{"logical": "game", "marker": "gamemodes/example"}],
     # DB tool convenience aliases: game name -> its MariaDB schema (optional; raw
-    # schema names always work too). e.g. {"scprp": "my_scprp_schema"}
+    # schema names always work too). e.g. {"game": "game_schema"}
     "db_aliases": {},
+    # MongoDB (optional — leave container blank to auto-detect any container whose
+    # name contains "mongo"; the mongo tools simply report "not found" if absent).
+    "mongo": {
+        "container": "",                    # exact docker container name, or "" to auto-detect
+        "auth_db": "admin",                 # --authenticationDatabase
+        "note": "",                         # shown in the tool description (e.g. host port mapping)
+    },
+    # Mongo convenience aliases: short name -> real mongo database name.
+    "mongo_aliases": {},
 }
 
 
@@ -159,15 +189,19 @@ def config_error():
 # JSON arg. Sidesteps every layer of shell quoting.
 # ----------------------------------------------------------------------------
 HOST_DRIVER = r'''
-import os, sys, json, base64, subprocess, pty, time, select, re
+import os, sys, json, base64, subprocess, pty, time, select, re, shutil
 
-VOLROOT = "@VOLROOT@"
-BAKROOT = "@BAKROOT@"                                 # deploy backups, OUT of every game tree
-WINGS_API = "@WINGS_API@"
-WINGS_CONFIG = "@WINGS_CONFIG@"
+VOLROOT = @VOLROOT_JSON@
+BAKROOT = @BAKROOT_JSON@                               # deploy backups, OUT of every game tree
+WINGS_API = @WINGS_API_JSON@
+WINGS_CONFIG = @WINGS_CONFIG_JSON@
 OWNER_UID = @OWNER_UID@                               # pterodactyl:pterodactyl on the node
 OWNER_GID = @OWNER_GID@
 SERVERS = @SERVERS_JSON@                              # [{"logical","marker"}], first marker match wins
+DIFF_FILE_MAX_BYTES = @DIFF_FILE_MAX_BYTES@
+DIFF_BATCH_MAX_INPUT_BYTES = @DIFF_BATCH_MAX_INPUT_BYTES@
+DEPLOY_FILE_MAX_BYTES = @DEPLOY_FILE_MAX_BYTES@
+DEPLOY_BATCH_MAX_INPUT_BYTES = @DEPLOY_BATCH_MAX_INPUT_BYTES@
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")             # SGR/color escapes (console.log noise)
 
 def jout(o):
@@ -299,12 +333,17 @@ def file_size(p):
 def read_delta(p, before, maxbytes=200000):
     try:
         with open(p, "rb") as f:
-            f.seek(before)
-            data = f.read().decode("utf-8", "replace")
+            f.seek(0, 2)
+            end = f.tell()
+            # Bound the read itself. Slicing after f.read() still lets one noisy
+            # command allocate the entire console delta in the root driver.
+            start = min(end, max(0, before))
+            if end - start > maxbytes:
+                start = end - maxbytes
+            f.seek(start)
+            data = f.read(maxbytes).decode("utf-8", "replace")
     except OSError:
         return ""
-    if len(data) > maxbytes:
-        data = data[-maxbytes:]
     return data
 
 def op_console(req):
@@ -332,7 +371,7 @@ def op_console(req):
     # bytes), then byte-cap what the client actually has to read. Keep the
     # most-recent (end) slice, same policy as op_fetch.
     out = _ANSI_RE.sub("", out)
-    maxb = int(req.get("maxbytes", 24000))
+    maxb = max(1, min(int(req.get("maxbytes", 24000)), 200000))
     orig = len(out)
     truncated = orig > maxb
     if truncated:
@@ -405,7 +444,7 @@ def op_lua(req):
 
     def b64d(s):
         try:
-            return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "replace")
+            return base64.b64decode(s + "=" * (-len(s) % 4), validate=True).decode("utf-8", "replace")
         except Exception:
             return ""
 
@@ -469,7 +508,11 @@ def op_lua(req):
 
 def op_fetch(req):
     u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
-    what = req.get("what", "console"); lines = int(req.get("lines", 200))
+    what = req.get("what", "console")
+    lines = max(1, min(int(req.get("lines", 200)), 2000))
+
+    if what == "history":
+        return _deployment_history(req)
 
     if what == "dir":
         base = _safe_under(gm, req.get("path", ""))
@@ -499,22 +542,24 @@ def op_fetch(req):
         if not base:
             return {"ok": False, "error": "path escapes volume"}
         glob = req.get("glob") or "*"
-        def sha1_of(fp):
-            h = hashlib.sha1()
+        def sha256_of(fp):
+            h = hashlib.sha256()
             with open(fp, "rb") as f:
                 for chunk in iter(lambda: f.read(65536), b""):
                     h.update(chunk)
-            return h.hexdigest()[:12]
+            return h.hexdigest()
         files = {}
         if os.path.isfile(base):
             try:
-                files[os.path.basename(base)] = [sha1_of(base), os.path.getsize(base)]
+                files[os.path.basename(base)] = [sha256_of(base), os.path.getsize(base)]
             except OSError as e:
                 return {"ok": False, "error": str(e)}
             return {"ok": True, "files": files, "count": 1, "truncated": False}
+        if not os.path.lexists(base):
+            return {"ok": True, "files": {os.path.basename(base): ["missing", 0]}, "count": 1, "truncated": False}
         if not os.path.isdir(base):
-            return {"ok": False, "error": "no such path: %s" % req.get("path", "")}
-        n = 0; capped = False
+            return {"ok": False, "error": "not a regular file or directory"}
+        n = 0; capped = False; skipped_escaped = 0
         for root, dirs, fnames in os.walk(base):
             dirs.sort()
             for fn in sorted(fnames):
@@ -526,34 +571,42 @@ def op_fetch(req):
                     break
                 fp = os.path.join(root, fn)
                 rel = fp[len(base):].lstrip("/")
+                safe_fp = _safe_under(gm, os.path.relpath(fp, gm))
+                if not safe_fp:
+                    # A file symlink can escape even though os.walk's starting
+                    # directory was confined. Do not hash/stat its outside target.
+                    files[rel] = [None, None]
+                    skipped_escaped += 1
+                    continue
                 try:
-                    files[rel] = [sha1_of(fp), os.path.getsize(fp)]
+                    files[rel] = [sha256_of(safe_fp), os.path.getsize(safe_fp)]
                 except OSError:
                     files[rel] = [None, None]
             if capped:
                 break
-        return {"ok": True, "files": files, "count": len(files), "truncated": capped}
+        return {"ok": True, "files": files, "count": len(files), "truncated": capped,
+                "skipped_escaped": skipped_escaped}
 
     if what == "backups":
-        broot = BAKROOT + "/" + u
         out = []
-        capped = False
-        for root, dirs, fnames in os.walk(broot):
-            dirs.sort()
-            for fn in sorted(fnames):
-                fp = os.path.join(root, fn)
-                rel = fp[len(broot):].lstrip("/")
-                try:
+        versions = os.path.join(_guard_root(u), "versions")
+        roots = ([(version, os.path.join(versions, version))
+                  for version in sorted(os.listdir(versions), reverse=True)]
+                 if os.path.isdir(versions) else [])
+        roots.append(("legacy", os.path.join(BAKROOT, u)))
+        for version, broot in roots:
+            for root, dirs, fnames in os.walk(broot):
+                dirs.sort()
+                for fn in sorted(fnames):
+                    fp = os.path.join(root, fn)
+                    rel = os.path.relpath(fp, broot).replace(os.sep, "/")
+                    if not rel.startswith(req.get("path") or ""):
+                        continue
+                    if len(out) >= 500:
+                        return {"ok": True, "backups": out, "truncated": True}
                     st = os.stat(fp)
-                    out.append({"path": rel, "size": st.st_size, "mtime": int(st.st_mtime)})
-                except OSError:
-                    pass
-                if len(out) >= 500:
-                    capped = True
-                    break
-            if capped:
-                break
-        return {"ok": True, "backups": out, "truncated": capped}
+                    out.append({"path": rel, "backup_id": version, "size": st.st_size, "mtime": int(st.st_mtime)})
+        return {"ok": True, "backups": out, "truncated": False}
 
     if what == "docker":
         # Console output history via the docker log driver — works WITHOUT
@@ -573,7 +626,7 @@ def op_fetch(req):
         if pat:
             out = "\n".join(l for l in out.splitlines() if pat in l)
         out = _ANSI_RE.sub("", out)
-        maxb = int(req.get("maxbytes", 48000))
+        maxb = max(1, min(int(req.get("maxbytes", 48000)), 200000))
         orig = len(out)
         truncated = orig > maxb
         if truncated:
@@ -585,8 +638,8 @@ def op_fetch(req):
         p = gm + "/console.log"
     elif what == "file":
         rel = req.get("path", "")
-        p = os.path.normpath(gm + "/" + rel.lstrip("/"))
-        if not p.startswith(os.path.normpath(gm)):
+        p = _safe_under(gm, rel)
+        if not p:
             return {"ok": False, "error": "path escapes volume"}
     else:
         return {"ok": False, "error": "unknown what: %s" % what}
@@ -597,17 +650,27 @@ def op_fetch(req):
         # the payload never reaches the model). Hard size cap.
         try:
             size = os.path.getsize(p)
-            cap = int(req.get("b64_max", 8000000))
+            cap = max(1, min(int(req.get("b64_max", 8000000)), 8000000))
             if size > cap:
                 return {"ok": False, "error": "file is %d bytes (> %d download cap)" % (size, cap)}
             with open(p, "rb") as f:
-                data = f.read()
+                data = f.read(cap + 1)
+            if len(data) > cap:
+                return {"ok": False, "error": "file grew beyond %d-byte download cap while reading" % cap}
         except OSError as e:
             return {"ok": False, "error": str(e)}
-        return {"ok": True, "path": p, "size": size,
+        import hashlib
+        return {"ok": True, "path": p, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                 "content_b64": base64.b64encode(data).decode()}
+    source_sha256 = None
     try:
         with open(p, "rb") as f:
+            if what == "file":
+                import hashlib
+                h = hashlib.sha256()
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+                source_sha256 = h.hexdigest()
             f.seek(0, 2)
             size = f.tell()
             block = min(size, lines * 400 + 8192)
@@ -626,7 +689,7 @@ def op_fetch(req):
     # window holds <= `lines` newlines (long / minified / JSON lines, or a run of
     # long log lines) the whole block comes back (tens of KB) instead of ~N short
     # lines -> the occasional over-return. Keep the most-recent (end) slice.
-    maxb = int(req.get("maxbytes", 48000))
+    maxb = max(1, min(int(req.get("maxbytes", 48000)), 200000))
     orig = len(tail)
     truncated = orig > maxb
     if truncated:
@@ -636,131 +699,434 @@ def op_fetch(req):
             tail = tail[nl + 1:]
         tail = "...[truncated: last %d of %d chars]...\n%s" % (len(tail), orig, tail)
     return {"ok": True, "path": p, "content": tail, "size": size,
-            "truncated": truncated, "bytes": len(tail)}
+            "truncated": truncated, "bytes": len(tail), "sha256": source_sha256}
 
 def _safe_under(gm, rel):
-    p = os.path.normpath(gm + "/" + rel.lstrip("/"))
-    root = os.path.normpath(gm)
-    if p == root or p.startswith(root + os.sep):
-        return p
+    """Resolve a path beneath root without prefix-collision or symlink escapes."""
+    try:
+        root = os.path.realpath(gm)
+        p = os.path.realpath(os.path.join(root, str(rel or "").lstrip("/")))
+        if os.path.commonpath((root, p)) == root:
+            return p
+    except (OSError, TypeError, ValueError):
+        pass
     return None
 
-def _deploy_write(u, gm, to, data, backup=True):
-    p = _safe_under(gm, to)
-    if not p:
-        return {"ok": False, "to": to, "error": "path escapes volume"}
-    existed = os.path.isfile(p)
-    bak = None
-    if existed and backup:
-        # mirror the path under a dedicated backups root so we NEVER drop .mcpbak files
-        # into addon/source/git trees. One latest backup per (server, path), overwritten.
-        bak = BAKROOT + "/" + u + "/" + to.lstrip("/")
-        try:
-            os.makedirs(os.path.dirname(bak), exist_ok=True)
-            with open(p, "rb") as f:
-                old = f.read()
-            with open(bak, "wb") as f:
-                f.write(old)
-        except OSError as e:
-            return {"ok": False, "to": to, "error": "backup failed: %s" % e}
+def _atomic_path(path):
+    return "%s.srcds_mcp_tmp_%d_%d" % (path, os.getpid(), time.time_ns())
+
+def _finish_owned_file(tmp, path):
     try:
-        d = os.path.dirname(p)
-        if d and not os.path.isdir(d):
-            os.makedirs(d, exist_ok=True)
-        with open(p, "wb") as f:
-            f.write(data)
+        os.chmod(tmp, 0o644)
+    except OSError:
+        pass
+    try:
+        os.chown(tmp, OWNER_UID, OWNER_GID)
+    except (OSError, AttributeError):
+        pass
+    os.replace(tmp, path)
+    _sync_parent(path)
+
+def _atomic_copy(src, dst, owned=False):
+    d = os.path.dirname(dst)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    tmp = _atomic_path(dst)
+    try:
+        shutil.copyfile(src, tmp)
+        with open(tmp, "r+b") as f:
+            os.fsync(f.fileno())
+        if owned:
+            _finish_owned_file(tmp, dst)
+        else:
+            os.replace(tmp, dst)
+            _sync_parent(dst)
+    except Exception:
         try:
-            os.chmod(p, 0o644)
+            os.remove(tmp)
         except OSError:
             pass
-        try:
-            os.chown(p, OWNER_UID, OWNER_GID)   # pterodactyl:pterodactyl
-        except (OSError, AttributeError):
-            pass
-    except OSError as e:
-        return {"ok": False, "to": to, "error": "write failed: %s" % e}
-    return {"ok": True, "to": to, "path": p, "bytes": len(data), "overwrote": existed, "backup": bak}
+        raise
 
-def _restore_one(u, gm, to):
-    # Roll back to the last deploy backup. Deliberately does NOT re-backup the
-    # current (bad) file first — that would overwrite the good backup and make
-    # a second restore impossible. The backup is kept as-is.
-    if not _safe_under(gm, to):
-        return {"ok": False, "to": to, "error": "path escapes volume"}
-    bak = BAKROOT + "/" + u + "/" + to.lstrip("/")
-    if not os.path.isfile(bak):
-        return {"ok": False, "to": to, "error": "no deploy backup recorded for %s" % to}
+def _atomic_write(path, data):
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    tmp = _atomic_path(path)
     try:
-        with open(bak, "rb") as f:
-            data = f.read()
-    except OSError as e:
-        return {"ok": False, "to": to, "error": "restore failed: %s" % e}
-    r = _deploy_write(u, gm, to, data, backup=False)
-    if r.get("ok"):
-        r["restored"] = True
-        r["backup"] = bak
-    return r
+        with open(tmp, "xb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _finish_owned_file(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+def _sha256_file(path):
+    import hashlib
+    if not os.path.lexists(path):
+        return "missing"
+    if not os.path.isfile(path):
+        raise ValueError("destination is not a regular file")
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _valid_expected(value):
+    return isinstance(value, str) and (value == "missing" or re.fullmatch(r"[0-9a-f]{64}", value) is not None)
+
+def _deploy_relative(value):
+    if not isinstance(value, str) or not value or "\\" in value or ":" in value or "\x00" in value:
+        raise ValueError("destination must be a non-empty garrysmod-relative path using '/' separators")
+    if value.startswith("/") or any(p in ("", ".", "..") for p in value.split("/")):
+        raise ValueError("destination cannot contain absolute, empty, '.' or '..' components")
+    return value
+
+def _guard_root(u):
+    if not isinstance(u, str) or re.fullmatch(r"[A-Za-z0-9_-]+", u) is None:
+        raise ValueError("invalid volume identifier")
+    root = _safe_under(BAKROOT, "_guard_v2/" + u)
+    if not root:
+        raise ValueError("guard root escapes backup root")
+    return root
+
+class _DeployLock:
+    """One advisory lock per volume, shared by all v2 driver processes."""
+    def __init__(self, root):
+        self.root = root
+        self.f = None
+
+    def __enter__(self):
+        os.makedirs(self.root, mode=0o700, exist_ok=True)
+        self.f = open(os.path.join(self.root, "deploy.lock"), "a+b")
+        if os.name == "nt":
+            import msvcrt
+            self.f.seek(0, 2)
+            if not self.f.tell():
+                self.f.write(b"0")
+                self.f.flush()
+        else:
+            import fcntl
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                if os.name == "nt":
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self.f.close()
+                    self.f = None
+                    raise TimeoutError("deployment lock busy; no files written")
+                time.sleep(0.05)
+
+    def __exit__(self, *unused):
+        if self.f is not None:
+            if os.name == "nt":
+                import msvcrt
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+            self.f.close()
+
+def _sync_parent(path):
+    if hasattr(os, "O_DIRECTORY"):
+        fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+def _audit_record(root, deploy_id, phase, record):
+    """Immutable durable metadata; never serialize a request or file contents."""
+    history = os.path.join(root, "history")
+    os.makedirs(history, mode=0o700, exist_ok=True)
+    path = os.path.join(history, deploy_id + "." + phase + ".json")
+    data = json.dumps(record, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    tmp = _atomic_path(path)
+    try:
+        with open(tmp, "xb") as f:
+            os.chmod(tmp, 0o600)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # The UUID suffix makes collisions negligible; never replace a receipt.
+        if os.path.exists(path):
+            raise FileExistsError("deployment receipt already exists")
+        os.replace(tmp, path)
+        _sync_parent(path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+def _deployment_target(req):
+    """Fresh marker resolution without Docker state or the client's discovery cache."""
+    logical = req.get("server")
+    if logical not in [s.get("logical") for s in SERVERS]:
+        raise ValueError("DEPLOY_TARGET_REQUIRED: upgraded client must supply a configured logical server")
+    matches = []
+    for u in sorted(os.listdir(VOLROOT)):
+        gm = os.path.join(VOLROOT, u, "garrysmod")
+        if not os.path.isdir(gm):
+            continue
+        # Preserve the configured first-marker rule used by read-only discovery.
+        matched = next((s.get("logical") for s in SERVERS
+                        if os.path.isdir(os.path.join(gm, s["marker"]))), None)
+        if matched == logical:
+            matches.append(u)
+    if len(matches) != 1 or matches[0] != req.get("uuid"):
+        raise ValueError("DEPLOY_TARGET_CHANGED_OR_AMBIGUOUS: fresh logical-to-volume mapping is not unique or has changed")
+    gm = _safe_under(VOLROOT, matches[0] + "/garrysmod")
+    if not gm:
+        raise ValueError("volume escapes configured volume root")
+    return gm
+
+def _restore_path(root, u, to, backup_id):
+    if backup_id == "legacy":
+        path = _safe_under(os.path.join(BAKROOT, u), to)
+    elif isinstance(backup_id, str) and re.fullmatch(r"[0-9]{20}-[0-9a-f]{16}", backup_id):
+        path = _safe_under(root, "versions/" + backup_id + "/" + to)
+        with open(os.path.join(root, "history", backup_id + ".prepared.json"), encoding="utf-8") as f:
+            record = json.load(f)
+        entry = next((e for e in record.get("files", []) if e.get("to") == to), None)
+        if not entry or entry.get("backup_id") != backup_id or _sha256_file(path) != entry.get("before_sha256"):
+            raise ValueError("backup is missing or does not match its recorded SHA-256")
+    else:
+        raise ValueError("restore requires an explicit backup_id from fetch history/backups, or 'legacy'")
+    if not path or not os.path.isfile(path):
+        raise ValueError("requested backup does not exist")
+    return path
+
+def _deployment_history(req):
+    root = _guard_root(req["uuid"])
+    history = os.path.join(root, "history")
+    prefix = req.get("path") or ""
+    limit = max(1, min(int(req.get("lines", 20)), 100))
+    before = req.get("before") or "~"
+    records = []
+    try:
+        names = sorted(os.listdir(history), reverse=True)
+    except FileNotFoundError:
+        names = []
+    used = 0
+    cursor = None
+    for name in names:
+        if not name.endswith(".json") or name >= before:
+            continue
+        with open(os.path.join(history, name), encoding="utf-8") as f:
+            record = json.load(f)
+        if prefix:
+            record["files"] = [e for e in record.get("files", []) if e.get("to", "").startswith(prefix)]
+            if not record["files"]:
+                continue
+        size = len(json.dumps(record))
+        if records and (len(records) >= limit or used + size > 180000):
+            break
+        records.append(record)
+        used += size
+        cursor = name
+    return {"ok": True, "history": records, "before": cursor,
+            "note": "prepared without a result means interrupted or uncertain; inspect live hashes before retrying"}
 
 def op_deploy(req):
-    u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
-    files = req.get("files")
-    if files is not None:
-        # Batch: refuse the whole batch up front if ANY path escapes (a typo must
-        # not yield a half-applied deploy), then write best-effort with a per-file
-        # report so one bad file doesn't abort the rest.
-        for f in files:
-            if not _safe_under(gm, f.get("to") or ""):
-                return {"ok": False, "error": "path escapes volume: %s" % f.get("to")}
-        results = []
-        for f in files:
-            if req.get("restore"):
-                results.append(_restore_one(u, gm, f["to"]))
-                continue
-            try:
-                data = base64.b64decode(f["content_b64"])
-            except Exception as e:
-                results.append({"ok": False, "to": f.get("to"), "error": "bad content: %s" % e})
-                continue
-            results.append(_deploy_write(u, gm, f["to"], data, req.get("backup", True)))
-        n_ok = sum(1 for r in results if r.get("ok"))
-        return {"ok": True, "batch": True, "results": results,
-                "n_ok": n_ok, "n_fail": len(results) - n_ok,
-                "bytes": sum(r.get("bytes", 0) for r in results if r.get("ok"))}
-    p = _safe_under(gm, req["to"])
-    if not p:
-        return {"ok": False, "error": "path escapes volume"}
-    if req.get("restore"):
-        r = _restore_one(u, gm, req["to"])
-        if not r.get("ok"):
-            return {"ok": False, "error": r.get("error")}
-        return r
+    import hashlib, uuid
+    deploy_id = "%020d-%s" % (time.time_ns(), uuid.uuid4().hex[:16])
+    batch = req.get("files") is not None
+    files = req.get("files") if batch else [req]
+    if not isinstance(files, list) or not files or len(files) > 400:
+        return {"ok": False, "error": "files must contain 1-400 entries"}
+    if req.get("backup", True) is not True:
+        return {"ok": False, "error": "versioned backups are mandatory; backup=false is no longer supported"}
+    restore = req.get("restore") is True
+    plans, metadata, seen = [], [], set()
+    total = 0
     try:
-        data = base64.b64decode(req["content_b64"])
+        root = _guard_root(req.get("uuid"))
+        for f in files:
+            if not isinstance(f, dict):
+                raise ValueError("every files item must be an object")
+            to = _deploy_relative(f.get("to"))
+            expected = f.get("expected_sha256")
+            if not _valid_expected(expected):
+                raise ValueError("STALE_BASE_REQUIRED: %s needs expected_sha256 of its original remote base, or 'missing' for creation" % to)
+            meta = {"to": to, "expected_sha256": expected,
+                    "source_path": str(f.get("source_path") or "inline")[:2048]}
+            plan = {"to": to, "expected": expected, "meta": meta}
+            if restore:
+                plan["restore_id"] = f.get("backup_id")
+                meta["restore_from"] = f.get("backup_id")
+            else:
+                data = base64.b64decode(f["content_b64"], validate=True)
+                total += len(data)
+                if len(data) > DEPLOY_FILE_MAX_BYTES or total > DEPLOY_BATCH_MAX_INPUT_BYTES:
+                    raise ValueError("deploy file or aggregate payload cap exceeded")
+                plan["data"] = data
+                meta["after_sha256"] = hashlib.sha256(data).hexdigest()
+                meta["bytes"] = len(data)
+            plans.append(plan)
+            metadata.append(meta)
+        record = {"protocol": 2, "deployment_id": deploy_id, "time_ns": time.time_ns(),
+                  "server": req.get("server"), "uuid": req.get("uuid"),
+                  "operation": "restore" if restore else "deploy", "files": metadata,
+                  "origin": {k: str((req.get("origin") or {}).get(k) or "")[:256]
+                             for k in ("client_instance", "pid", "tool_version", "thread_id", "source_revision")}}
+        with _DeployLock(root):
+            try:
+                gm = _deployment_target(req)
+                conflicts = []
+                for p in plans:
+                    path = _safe_under(gm, p["to"])
+                    if not path or path == os.path.realpath(gm):
+                        raise ValueError("path escapes volume")
+                    if path in seen:
+                        raise ValueError("duplicate canonical destination: %s" % p["to"])
+                    seen.add(path)
+                    p["path"] = path
+                    current = _sha256_file(path)
+                    p["meta"]["before_sha256"] = current
+                    if current != p["expected"]:
+                        conflicts.append({"to": p["to"], "expected_sha256": p["expected"], "actual_sha256": current})
+                    if restore:
+                        p["restore_path"] = _restore_path(root, req["uuid"], p["to"], p["restore_id"])
+                        p["meta"]["after_sha256"] = _sha256_file(p["restore_path"])
+                        p["meta"]["bytes"] = os.path.getsize(p["restore_path"])
+                    p["noop"] = current == p["meta"]["after_sha256"]
+                    if current != "missing" and not p["noop"]:
+                        p["backup"] = _safe_under(root, "versions/" + deploy_id + "/" + p["to"])
+                        if not p["backup"]:
+                            raise ValueError("backup path escapes root")
+                        p["meta"]["backup_id"] = deploy_id
+                if conflicts:
+                    record.update({"phase": "rejected", "conflicts": conflicts})
+                    _audit_record(root, deploy_id, "rejected", record)
+                    return {"ok": False, "deployment_id": deploy_id, "conflicts": conflicts,
+                            "error": "STALE_BASE: entire batch rejected; re-fetch and reconcile changes, then use the reconciled base hash. Do not attach a fresh hash to stale content."}
+                record["phase"] = "prepared"
+                _audit_record(root, deploy_id, "prepared", record)
+                # Preserve ALL previous versions before changing any target.
+                for p in plans:
+                    if p.get("backup"):
+                        _atomic_copy(p["path"], p["backup"])
+                        if _sha256_file(p["backup"]) != p["expected"]:
+                            raise ValueError("source changed during backup; no target files written")
+            except Exception as e:
+                record.update({"phase": "rejected", "error": str(e)})
+                _audit_record(root, deploy_id, "rejected", record)
+                return {"ok": False, "deployment_id": deploy_id, "error": str(e)}
+            results = []
+            try:
+                for p in plans:
+                    # Detect a non-MCP writer before each replace; such writers do not honor our lock.
+                    if _safe_under(gm, p["to"]) != p["path"] or _sha256_file(p["path"]) != p["expected"]:
+                        raise ValueError("destination changed outside the deployment lock")
+                    if not p["noop"]:
+                        if restore:
+                            if _sha256_file(p["restore_path"]) != p["meta"]["after_sha256"]:
+                                raise ValueError("restore source changed after preflight")
+                            _atomic_copy(p["restore_path"], p["path"], owned=True)
+                        else:
+                            _atomic_write(p["path"], p["data"])
+                    actual = _sha256_file(p["path"])
+                    if actual != p["meta"]["after_sha256"]:
+                        raise ValueError("post-write verification failed")
+                    results.append(dict(p["meta"], ok=True, noop=p["noop"], backup=p.get("backup"),
+                                        overwrote=p["expected"] != "missing", restored=restore))
+                outcome = "complete"
+                error = None
+            except Exception as e:
+                outcome = "partial_or_uncertain"
+                error = str(e)
+                for p in plans[len(results):]:
+                    results.append(dict(p["meta"], ok=False, error="not confirmed: " + error))
+            result = dict(record, phase="result", outcome=outcome, files=results,
+                          ok=outcome == "complete", error=error, batch=batch, results=results,
+                          n_ok=sum(1 for r in results if r["ok"]),
+                          n_fail=sum(1 for r in results if not r["ok"]),
+                          bytes=sum(r.get("bytes", 0) for r in results if r["ok"] and not r.get("noop")))
+            try:
+                _audit_record(root, deploy_id, "result", {k: v for k, v in result.items() if k != "results"})
+            except Exception as e:
+                result.update(ok=False, outcome="partial_or_uncertain",
+                              error="receipt failed after possible writes; inspect history and hashes before retrying: %s" % e)
+            if not batch and results:
+                for k, v in results[0].items():
+                    if k not in result:
+                        result[k] = v
+            return result
     except Exception as e:
-        return {"ok": False, "error": "bad content: %s" % e}
-    r = _deploy_write(u, gm, req["to"], data, req.get("backup", True))
-    if not r.get("ok"):
-        return {"ok": False, "error": r.get("error")}
-    return r
+        return {"ok": False, "deployment_id": deploy_id, "error": str(e)}
+
 
 def op_grep(req):
     u = req["uuid"]; gm = VOLROOT + "/" + u + "/garrysmod"
-    base = _safe_under(gm, req.get("path", ""))
-    if not base:
-        return {"ok": False, "error": "path escapes volume"}
-    if not os.path.exists(base):
-        return {"ok": False, "error": "no such path: %s" % base}
-    glob = req.get("glob") or "*.lua"
-    mx = int(req.get("max", 200))
-    cmd = ["grep", "-rnI", "--include", glob, "-e", req["pattern"], base]
+    patterns = req.get("patterns") or ([req.get("pattern")] if req.get("pattern") else [])
+    globs = req.get("globs") or ([req.get("glob")] if req.get("glob") else ["*.lua"])
+    exclude_globs = req.get("exclude_globs") or []
+    rel_paths = req.get("paths") or [req.get("path", "")]
+    if not patterns or any(not isinstance(x, str) or not x for x in patterns):
+        return {"ok": False, "error": "at least one non-empty grep pattern is required"}
+    if any(not isinstance(x, str) or not x for x in globs + exclude_globs):
+        return {"ok": False, "error": "grep globs must be non-empty strings"}
+    bases = []
+    for rel in rel_paths:
+        base = _safe_under(gm, rel)
+        if not base:
+            return {"ok": False, "error": "path escapes volume: %s" % rel}
+        if not os.path.exists(base):
+            return {"ok": False, "error": "no such path: %s" % rel}
+        bases.append(base)
+    mx = max(1, min(int(req.get("max", 200)), 2000))
+    cmd = ["grep", "-rnI"]
+    for glob in globs:
+        cmd += ["--include", glob]
+    for glob in exclude_globs:
+        cmd += ["--exclude", glob]
+    for pattern in patterns:
+        cmd += ["-e", pattern]
+    cmd += bases
+    # Cap grep at the pipe, not after communicate(): a broad/minified match must
+    # never allocate an unbounded stdout buffer in the root host driver.
+    capture_cap = 50000
+    g = h = None
     try:
-        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             timeout=30).stdout.decode("utf-8", "replace")
+        g = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        h = subprocess.Popen(["head", "-c", str(capture_cap + 1)], stdin=g.stdout,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        g.stdout.close()
+        raw, _ = h.communicate(timeout=30)
+        byte_capped = len(raw) > capture_cap
+        raw = raw[:capture_cap]
+        if byte_capped and g.poll() is None:
+            g.terminate()
+        try:
+            g.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            g.kill(); g.wait()
+        err = g.stderr.read().decode("utf-8", "replace")[-500:]
+        if not byte_capped and g.returncode not in (0, 1):
+            return {"ok": False, "error": "grep rc=%s: %s" % (g.returncode, err)}
+        out = raw.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        for p in (h, g):
+            if p is not None and p.poll() is None:
+                p.kill()
+        return {"ok": False, "error": "grep timed out after 30s"}
     except Exception as e:
+        for p in (h, g):
+            if p is not None and p.poll() is None:
+                p.kill()
         return {"ok": False, "error": "grep failed: %s" % e}
     lines = out.splitlines()
     total = len(lines)
-    pref = os.path.normpath(gm) + "/"
+    pref = os.path.realpath(gm) + os.sep
     # Cap each line (a match inside a minified/packed line would otherwise return
     # the WHOLE line) and the total payload, so one grep can't flood the client.
     shown, used, capped = [], 0, False
@@ -773,13 +1139,16 @@ def op_grep(req):
             break
         used += len(l) + 1
         shown.append(l)
-    r = {"ok": True, "matches": shown, "total": total, "shown": len(shown)}
+    capped = capped or byte_capped or total > mx
+    r = {"ok": True, "matches": shown, "total": total, "shown": len(shown),
+         "total_exact": not byte_capped, "truncated": capped}
     if capped:
-        r["note"] = "byte-capped; narrow with path/glob or a stricter pattern"
+        r["note"] = "capture-capped; narrow paths/globs/patterns for a complete result"
     return r
 
-def op_diff(req):
+def _diff_one(req, diff_cap=40000, batch=False):
     import difflib, hashlib
+    file_cap = max(1, min(int(req.get("file_max_bytes", DIFF_FILE_MAX_BYTES)), DIFF_FILE_MAX_BYTES))
     def readside(u, rel):
         gm = VOLROOT + "/" + u + "/garrysmod"
         p = _safe_under(gm, rel)
@@ -788,6 +1157,9 @@ def op_diff(req):
         if not os.path.isfile(p):
             return None, "no such file: %s" % rel
         try:
+            size = os.path.getsize(p)
+            if size > file_cap:
+                return None, "file is %d bytes (> %d diff cap)" % (size, file_cap)
             with open(p, "rb") as f:
                 return f.read(), None
         except OSError as e:
@@ -797,30 +1169,108 @@ def op_diff(req):
         return {"ok": False, "error": "A(%s): %s" % (req.get("label_a", "a"), err)}
     if req.get("content_b64") is not None:
         try:
-            b = base64.b64decode(req["content_b64"])
+            b = base64.b64decode(req["content_b64"], validate=True)
         except Exception as e:
             return {"ok": False, "error": "bad local content: %s" % e}
+        if len(b) > file_cap:
+            return {"ok": False, "error": "local file is %d bytes (> %d diff cap)" % (len(b), file_cap)}
     else:
         b, err = readside(req["uuid_b"], req["path_b"])
         if err:
             return {"ok": False, "error": "B(%s): %s" % (req.get("label_b", "b"), err)}
     meta = {"ok": True, "equal": a == b, "size_a": len(a), "size_b": len(b),
-            "sha_a": hashlib.sha1(a).hexdigest()[:12], "sha_b": hashlib.sha1(b).hexdigest()[:12]}
+            "sha_a": hashlib.sha1(a).hexdigest()[:12], "sha_b": hashlib.sha1(b).hexdigest()[:12],
+            "sha256_a": hashlib.sha256(a).hexdigest(), "sha256_b": hashlib.sha256(b).hexdigest()}
     if meta["equal"]:
         return meta
     if b"\x00" in a[:8192] or b"\x00" in b[:8192]:
         meta["binary"] = True
         return meta
-    d = "".join(difflib.unified_diff(
-        a.decode("utf-8", "replace").splitlines(True),
-        b.decode("utf-8", "replace").splitlines(True),
-        fromfile=req.get("label_a", "a"), tofile=req.get("label_b", "b"),
-        n=int(req.get("context", 3))))
-    if len(d) > 40000:
-        meta["truncated"] = True
-        d = d[:40000] + "\n...[diff truncated at 40KB]"
+    diff_cap = max(0, int(diff_cap))
+    suffix = ("\n...[diff truncated for batch output budget]" if batch
+              else "\n...[diff truncated at 40KB]")
+    parts = []
+    used = 0
+    for piece in difflib.unified_diff(
+            a.decode("utf-8", "replace").splitlines(True),
+            b.decode("utf-8", "replace").splitlines(True),
+            fromfile=req.get("label_a", "a"), tofile=req.get("label_b", "b"),
+            n=int(req.get("context", 3))):
+        if used + len(piece) > diff_cap:
+            meta["truncated"] = True
+            room = max(0, diff_cap - used)
+            if room:
+                parts.append(piece[:room])
+            break
+        parts.append(piece)
+        used += len(piece)
+    d = "".join(parts)
+    if meta.get("truncated"):
+        if diff_cap <= len(suffix):
+            d = suffix[:diff_cap]
+        else:
+            d = d[:diff_cap - len(suffix)] + suffix
     meta["diff"] = d
     return meta
+
+def op_diff(req):
+    files = req.get("files")
+    if files is None:
+        return _diff_one(req, 40000)
+    if not isinstance(files, list) or not files:
+        return {"ok": False, "error": "files must be a non-empty array"}
+    if len(files) > 200:
+        return {"ok": False, "error": "batch has %d files (max 200)" % len(files)}
+    try:
+        maxbytes = max(0, min(int(req.get("maxbytes", 48000)), 200000))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "maxbytes must be an integer"}
+    # Preflight every side before reading/diffing so a 200-file request cannot turn
+    # the output cap into an unbounded input/CPU budget.
+    input_bytes = 0
+    for f in files:
+        if not isinstance(f, dict):
+            return {"ok": False, "error": "every files item must be an object"}
+        for side in ("a", "b"):
+            if side == "b" and f.get("content_b64") is not None:
+                raw = f.get("content_b64") or ""
+                size = max(0, (len(raw.rstrip("=")) * 3) // 4)
+            else:
+                uk, pk = ("uuid_a", "path_a") if side == "a" else ("uuid_b", "path_b")
+                if not f.get(uk) or f.get(pk) is None:
+                    return {"ok": False, "error": "missing %s side" % side.upper()}
+                root = VOLROOT + "/" + f[uk] + "/garrysmod"
+                p = _safe_under(root, f[pk])
+                if not p or not os.path.isfile(p):
+                    return {"ok": False, "error": "%s side missing/escaped: %s" % (side.upper(), f.get(pk))}
+                try:
+                    size = os.path.getsize(p)
+                except OSError as e:
+                    return {"ok": False, "error": "%s side stat: %s" % (side.upper(), e)}
+            if size > DIFF_FILE_MAX_BYTES:
+                return {"ok": False, "error": "%s side is %d bytes (> %d per-file diff cap)" %
+                        (side.upper(), size, DIFF_FILE_MAX_BYTES)}
+            input_bytes += size
+            if input_bytes > DIFF_BATCH_MAX_INPUT_BYTES:
+                return {"ok": False, "error": "batch input exceeds %d-byte diff cap" %
+                        DIFF_BATCH_MAX_INPUT_BYTES}
+    # Divide the aggregate diff budget fairly so one large file cannot hide all
+    # later comparisons. Metadata for every item is always returned.
+    per_file_cap = min(40000, maxbytes // len(files)) if maxbytes else 0
+    results = []
+    for f in files:
+        try:
+            results.append(_diff_one(f, per_file_cap, batch=True))
+        except Exception as e:
+            results.append({"ok": False, "error": "diff exception: %s" % e})
+    n_fail = sum(1 for r in results if not r.get("ok"))
+    n_equal = sum(1 for r in results if r.get("ok") and r.get("equal"))
+    n_differ = len(results) - n_fail - n_equal
+    return {"ok": True, "batch": True, "results": results,
+            "n_equal": n_equal, "n_differ": n_differ, "n_fail": n_fail,
+            "n_binary": sum(1 for r in results if r.get("ok") and r.get("binary")),
+            "n_truncated": sum(1 for r in results if r.get("ok") and r.get("truncated")),
+            "maxbytes": maxbytes, "input_bytes": input_bytes}
 
 def op_nodeinfo(req):
     info = {}
@@ -1044,6 +1494,246 @@ def op_bootwatch(req):
             live_err = "wings state: %s" % e
     return {"ok": True, "watch": d, "state": live, "state_err": live_err}
 
+# --- generic monitor ----------------------------------------------------------
+# srcds_monitor generalizes the boot watcher: a tiny detached process either
+# follows the container console (docker logs -f, works on every server with no
+# -condebug) for a regex, or polls wings state for an up/down transition (down
+# also captures the last console lines at death - crash forensics). Verdict goes
+# to /tmp/srcds_monitor_<uuid>_<id>.json; MCP has no push channel, so the
+# returning check call IS the notification.
+MONITOR_SRC = """
+import sys, json, time, re, os, subprocess, urllib.request
+u, mode, pattern, out, timeout_s, api, cfgpath, nonce = sys.argv[1:9]
+timeout_s = float(timeout_s)
+ANSI = re.compile("\\x1b\\\\[[0-9;]*[A-Za-z]")
+def proc_start(pid):
+    try:
+        raw=open("/proc/%d/stat" % pid).read()
+        return raw.rsplit(")",1)[1].split()[19]
+    except Exception:
+        return None
+d = {"pid": os.getpid(), "pid_start": proc_start(os.getpid()), "nonce": nonce,
+     "mode": mode, "pattern": pattern, "armed": time.time(),
+     "phase": "watching", "match_count": 0, "matches": [], "history": [], "note": ""}
+def write():
+    try:
+        with open(out, "w") as f:
+            json.dump(d, f)
+        os.chmod(out, 0o600)
+    except Exception:
+        pass
+def token():
+    try:
+        for line in open(cfgpath):
+            if line.startswith("token:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+def wstate():
+    tok = token()
+    if not tok:
+        return None
+    try:
+        rq = urllib.request.Request(api + "/api/servers/" + u,
+                                    headers={"Authorization": "Bearer " + tok, "Accept": "application/json"})
+        b = urllib.request.urlopen(rq, timeout=8).read().decode("utf-8", "replace")
+        m = re.search('"state"\\\\s*:\\\\s*"([a-z]+)"', b)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+def tail_lines(n):
+    try:
+        r = subprocess.run(["docker", "logs", "--tail", str(n), u],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+        ls = ANSI.sub("", r.stdout.decode("utf-8", "replace")).splitlines()
+        return [l.rstrip()[:300] for l in ls[-n:]]
+    except Exception as e:
+        return ["<tail failed: %s>" % e]
+t0 = time.time(); write()
+if mode == "pattern":
+    rx = re.compile(pattern)
+    lastwrite = t0
+    while time.time() < t0 + timeout_s:
+        try:
+            p = subprocess.Popen(["docker", "logs", "-f", "--tail", "0", u],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except Exception as e:
+            d["note"] = "docker logs: %s" % e; write(); time.sleep(5); continue
+        for raw in p.stdout:
+            if time.time() > t0 + timeout_s:
+                break
+            line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
+            if rx.search(line):
+                d["match_count"] += 1
+                d["matches"].append([round(time.time() - t0, 1), line[:300]])
+                d["matches"] = d["matches"][-50:]
+                if d["phase"] == "watching":
+                    d["phase"] = "triggered"
+                write(); lastwrite = time.time()
+            elif time.time() - lastwrite > 10:
+                write(); lastwrite = time.time()      # heartbeat
+        try:
+            p.kill()
+        except Exception:
+            pass
+        if time.time() >= t0 + timeout_s:
+            break
+        d["note"] = "log stream ended (container stop/restart?) - re-attaching"
+        write(); time.sleep(4)
+else:  # mode "down" / "up" - wings state transition (one-shot)
+    last = None
+    lastwrite = t0
+    while time.time() < t0 + timeout_s:
+        s = wstate()
+        if s != last:
+            d["history"].append([round(time.time() - t0, 1), s])
+            d["history"] = d["history"][-20:]
+            trig = (mode == "down" and s == "offline" and last not in (None, "offline")) or \\
+                   (mode == "up" and s == "running" and last is not None and last != "running")
+            last = s
+            if trig:
+                d["phase"] = "triggered"; d["t_event"] = round(time.time() - t0, 1)
+                if mode == "down":
+                    d["context"] = tail_lines(40)
+                write(); sys.exit(0)
+            write(); lastwrite = time.time()
+        elif time.time() - lastwrite > 15:
+            write(); lastwrite = time.time()          # heartbeat
+        time.sleep(4)
+if d["phase"] == "watching":
+    d["phase"] = "expired"
+else:
+    d["phase"] = "done"
+write()
+"""
+
+MONITOR_ROOT = "/tmp/srcds_mcp_monitors"
+
+def _ensure_monitor_root():
+    try:
+        os.makedirs(MONITOR_ROOT, mode=0o700, exist_ok=True)
+        os.chmod(MONITOR_ROOT, 0o700)
+        return True
+    except OSError:
+        return False
+
+def _mon_path(u, mid):
+    return MONITOR_ROOT + "/%s_%s.json" % (u, mid)
+
+def _proc_start(pid):
+    try:
+        raw = open("/proc/%d/stat" % pid).read()
+        return raw.rsplit(")", 1)[1].split()[19]
+    except Exception:
+        return None
+
+def op_monitor(req):
+    import glob as _glob
+    u = req["uuid"]; act = req.get("act", "list")
+    if not _ensure_monitor_root():
+        return {"ok": False, "error": "could not create private monitor state directory"}
+    for f in _glob.glob(MONITOR_ROOT + "/%s_*.json" % u):   # GC day-old verdicts
+        try:
+            if time.time() - os.path.getmtime(f) > 86400:
+                os.remove(f)
+        except OSError:
+            pass
+    if act == "arm":
+        mid = req["id"]
+        out = _mon_path(u, mid)
+        nonce = os.urandom(16).hex()
+        try:
+            subprocess.Popen(["python3", "-c", MONITOR_SRC, u, req["mode"],
+                              req.get("pattern") or "", out,
+                              str(float(req.get("timeout_s", 1800))), WINGS_API, WINGS_CONFIG, nonce],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:
+            return {"ok": False, "error": "arm monitor: %s" % e}
+        for _ in range(10):          # confirm the watcher actually came up
+            if os.path.isfile(out):
+                break
+            time.sleep(0.2)
+        return {"ok": True, "armed": True, "id": mid, "statefile": os.path.isfile(out)}
+    if act == "list":
+        mons = []
+        for f in sorted(_glob.glob(MONITOR_ROOT + "/%s_*.json" % u)):
+            try:
+                with open(f) as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            mons.append({"id": f.rsplit("_", 1)[1][:-5], "mode": d.get("mode"),
+                         "pattern": (d.get("pattern") or "")[:60], "phase": d.get("phase"),
+                         "matches": d.get("match_count", 0),
+                         "age_s": round(time.time() - d.get("armed", time.time()), 1)})
+        return {"ok": True, "monitors": mons}
+    mid = req.get("id") or ""
+    if not re.match(r"^[a-f0-9]{4,16}$", mid):
+        return {"ok": False, "error": "bad/missing monitor id"}
+    out = _mon_path(u, mid)
+    def read():
+        try:
+            with open(out) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    if act == "stop":
+        d = read()
+        if not d:
+            return {"ok": False, "error": "no such monitor %s" % mid}
+        # The watcher runs start_new_session=True, so it leads its own process
+        # group; kill the GROUP so a pattern-mode `docker logs -f` child dies
+        # with it instead of following the console as an orphan forever.
+        killed = False
+        if d.get("phase") in ("watching", "triggered"):
+            try:
+                pid = int(d.get("pid", 0))
+                nonce = str(d.get("nonce") or "")
+                current_start = _proc_start(pid)
+                with open("/proc/%d/cmdline" % pid, "rb") as f:
+                    cmdline = f.read().decode("utf-8", "replace")
+                identity_ok = (pid > 1 and current_start and current_start == str(d.get("pid_start"))
+                               and nonce and nonce in cmdline and os.getpgid(pid) == pid)
+                if not identity_ok:
+                    return {"ok": False, "error": "monitor process identity no longer matches; refusing to signal PID"}
+                try:
+                    os.killpg(pid, 15)
+                except (OSError, AttributeError):
+                    os.kill(pid, 15)
+                killed = True
+                d["phase"] = "stopped"
+            except Exception as e:
+                return {"ok": False, "error": "could not safely stop monitor: %s" % e}
+        try:
+            with open(out, "w") as f:
+                json.dump(d, f)
+        except OSError:
+            pass
+        return {"ok": True, "watch": d, "killed": killed}
+    # act "check": long-poll until a hit / final phase / deadline
+    deadline = time.time() + min(float(req.get("wait", 0)), 55)
+    after = int(req.get("after", 0))
+    while True:
+        d = read()
+        if d:
+            ph = d.get("phase")
+            if ph in ("expired", "stopped", "done"):
+                break
+            if d.get("mode") == "pattern":
+                if d.get("match_count", 0) > after:
+                    break
+            elif ph != "watching":
+                break
+        if time.time() >= deadline:
+            break
+        time.sleep(2)
+    if not d:
+        return {"ok": False, "error": "no such monitor %s (verdicts GC after 24h)" % mid}
+    d["elapsed"] = round(time.time() - d.get("armed", time.time()), 1)
+    return {"ok": True, "watch": d, "id": mid}
+
 def _mariadb_cid():
     for name, cid in docker_ps().items():
         if "maria" in name.lower():
@@ -1062,7 +1752,11 @@ def op_db(req):
         return {"ok": False, "error": "mariadb container not found"}
     fmt = req.get("format", "table")
     opt = "--batch" if fmt == "tsv" else "-t"
-    full = (("USE `%s`;\n" % db) if db else "") + sql
+    prefix = (("USE `%s`;\n" % db) if db else "")
+    if req.get("read_only"):
+        full = prefix + "START TRANSACTION READ ONLY;\n" + sql + "\nROLLBACK;"
+    else:
+        full = prefix + sql
     # MYSQL_PWD keeps the password OUT of any command line; it stays inside the container.
     inner = 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mariadb -uroot --default-character-set=utf8mb4 -A %s' % opt
     try:
@@ -1077,6 +1771,55 @@ def op_db(req):
     truncated = len(out) > maxb
     if truncated:
         out = out[:maxb]
+    return {"ok": r.returncode == 0, "rc": r.returncode, "output": out,
+            "error_out": err.strip(), "truncated": truncated}
+
+def _mongo_cid(name=None):
+    ps = docker_ps()
+    if name and ps.get(name):
+        return ps[name]
+    for n, cid in ps.items():
+        if "mongo" in n.lower():
+            return cid
+    return None
+
+def op_mongo(req):
+    script = req.get("script")
+    if not script:
+        return {"ok": False, "error": "empty script"}
+    db = req.get("database") or ""
+    if db and not all(c.isalnum() or c in "_-" for c in db):
+        return {"ok": False, "error": "invalid database name"}
+    cid = _mongo_cid(req.get("container"))
+    if not cid:
+        return {"ok": False, "error": "mongo container not found"}
+    authdb = req.get("auth_db") or "admin"
+    if not all(c.isalnum() or c in "_-" for c in authdb):
+        return {"ok": False, "error": "invalid auth db"}
+    jsonflag = "--json=relaxed " if req.get("format") == "json" else ""
+    # Credentials come from the container's own env ($MONGO_INITDB_ROOT_*) and are
+    # never read out or passed from the host; if the deployment runs without auth
+    # the -u/-p pair is simply omitted. The SCRIPT travels as an env var (not argv)
+    # so quoting is never an issue and it survives arbitrary length.
+    inner = ('set -- ; '
+             'if [ -n "$MONGO_INITDB_ROOT_USERNAME" ]; then '
+             'set -- -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" '
+             '--authenticationDatabase %s; fi; '
+             'exec mongosh --quiet %s"$@" %s --eval "$SRCDS_MONGO_SCRIPT"'
+             % (authdb, jsonflag, (("'%s'" % db) if db else "")))
+    try:
+        r = subprocess.run(["docker", "exec", "-i", "-e", "SRCDS_MONGO_SCRIPT=" + script,
+                            cid, "sh", "-c", inner],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    except Exception as e:
+        return {"ok": False, "error": "mongo exec failed: %s" % e}
+    out = r.stdout.decode("utf-8", "replace")
+    err = r.stderr.decode("utf-8", "replace")
+    maxb = int(req.get("maxbytes", 40000))
+    truncated = len(out) > maxb
+    if truncated:
+        out = out[:maxb]
+    # mongosh prints script errors (TypeError/MongoServerError) on stdout with rc=1.
     return {"ok": r.returncode == 0, "rc": r.returncode, "output": out,
             "error_out": err.strip(), "truncated": truncated}
 
@@ -1110,8 +1853,12 @@ def main():
             jout(op_power(req))
         elif op == "bootwatch":
             jout(op_bootwatch(req))
+        elif op == "monitor":
+            jout(op_monitor(req))
         elif op == "db":
             jout(op_db(req))
+        elif op == "mongo":
+            jout(op_mongo(req))
         else:
             jout({"ok": False, "error": "unknown op: %s" % op})
     except Exception as e:
@@ -1129,13 +1876,17 @@ main()
 # across developers; a different deployment's config yields a different driver+hash.
 def _render_driver(tmpl):
     return (tmpl
-            .replace("@VOLROOT@", CFG["volroot"])
-            .replace("@BAKROOT@", CFG["backups_root"])
-            .replace("@WINGS_API@", CFG["wings"]["api"])
-            .replace("@WINGS_CONFIG@", CFG["wings"]["config"])
-            .replace("@OWNER_UID@", str(int(CFG["owner_uid"])))
-            .replace("@OWNER_GID@", str(int(CFG["owner_gid"])))
-            .replace("@SERVERS_JSON@", json.dumps(CFG["servers"])))
+            .replace("@VOLROOT_JSON@", json.dumps(CFG["volroot"]))
+            .replace("@BAKROOT_JSON@", json.dumps(CFG["backups_root"]))
+            .replace("@WINGS_API_JSON@", json.dumps(CFG["wings"]["api"]))
+            .replace("@WINGS_CONFIG_JSON@", json.dumps(CFG["wings"]["config"]))
+             .replace("@OWNER_UID@", str(int(CFG["owner_uid"])))
+             .replace("@OWNER_GID@", str(int(CFG["owner_gid"])))
+             .replace("@DIFF_FILE_MAX_BYTES@", str(DIFF_FILE_MAX_BYTES))
+             .replace("@DIFF_BATCH_MAX_INPUT_BYTES@", str(DIFF_BATCH_MAX_INPUT_BYTES))
+             .replace("@DEPLOY_FILE_MAX_BYTES@", str(DEPLOY_FILE_MAX_BYTES))
+             .replace("@DEPLOY_BATCH_MAX_INPUT_BYTES@", str(DEPLOY_BATCH_MAX_INPUT_BYTES))
+             .replace("@SERVERS_JSON@", json.dumps(CFG["servers"])))
 
 
 HOST_DRIVER = _render_driver(HOST_DRIVER)
@@ -1149,9 +1900,47 @@ _DRIVER_REMOTE = "/tmp/srcds_host_driver_%s.py" % _DRIVER_HASH
 _driver_ready = False
 
 
+_LOG_TEXT_KEYS = {"cmd", "code", "sql", "script", "pattern", "target",
+                  "to", "path", "local", "save_to", "backup"}
+
+
+def _redact_log_record(rec):
+    out = dict(rec)
+    for key in list(out):
+        if key not in _LOG_TEXT_KEYS or not isinstance(out.get(key), str):
+            continue
+        value = out.pop(key)
+        if key == "target":
+            out["target_mode"] = "all" if value.lower() == "all" else "specific"
+        out[key + "_chars"] = len(value)
+        out[key + "_bytes"] = len(value.encode("utf-8", "replace"))
+    return out
+
+
+def _rotate_log_if_needed():
+    try:
+        if os.path.getsize(LOG_PATH) < LOG_ROTATE_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        oldest = LOG_PATH + ".%d" % LOG_ROTATE_KEEP
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(LOG_ROTATE_KEEP - 1, 0, -1):
+            src, dst = LOG_PATH + ".%d" % i, LOG_PATH + ".%d" % (i + 1)
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+
+
 def log_event(rec):
     try:
+        rec = _redact_log_record(rec)
         rec["t"] = time.time()
+        _rotate_log_if_needed()
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
@@ -1225,7 +2014,7 @@ def run_driver(req, timeout=45, _retried=False):
 _disc_cache = {"t": 0, "data": None}
 
 
-def discover(force=False):
+def discover(force=False, strict=False):
     if (not force) and _disc_cache["data"] is not None and (time.time() - _disc_cache["t"] < 20):
         return _disc_cache["data"]
     d = run_driver({"op": "discover"}, timeout=40)
@@ -1234,16 +2023,16 @@ def discover(force=False):
         _disc_cache["t"] = time.time()
         _disc_cache["data"] = servers
         return servers
-    # keep stale on failure
+    if strict:
+        return []
+    # Read-only callers may use the last snapshot on failure.
     return _disc_cache["data"] if _disc_cache["data"] is not None else []
 
 
-def resolve(server):
-    """logical name -> server dict (or None)."""
-    for s in discover():
-        if s.get("logical") == server:
-            return s
-    return None
+def resolve(server, fresh=False):
+    """Resolve exactly one target; writes require successful fresh discovery."""
+    matches = [s for s in discover(force=fresh, strict=fresh) if s.get("logical") == server]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ----------------------------------------------------------------------------
@@ -1287,12 +2076,14 @@ def a2s_info(ip, port, timeout=2.0):
 
 
 def live_info(srv):
-    """Return (players, maxplayers, is_live) for a resolved server dict."""
-    if not srv or not srv.get("running") or not srv.get("port"):
+    """Return (players, maxplayers, live-state); live-state is tri-state."""
+    if not srv or not srv.get("running"):
         return (None, None, False)
+    if not srv.get("port"):
+        return (None, None, None)
     a = a2s_info(PUBLIC_IP, srv["port"])
     if not a:
-        return (None, None, False)
+        return (None, None, None)
     thr = LIVE_THRESHOLD.get(srv["logical"], 9999)
     return (a["players"], a["maxplayers"], a["players"] >= thr)
 
@@ -1319,6 +2110,18 @@ LUA_OPAQUE = re.compile(
     r"(?i)(_G\s*\[|getfenv\b|setfenv\b|\bloadstring\b|\bload\s*\(|string\.char\b|string\.byte\b|"
     r"\[\s*[\"'][A-Za-z_]\w*[\"']\s*\]\s*\()")
 
+LUA_MUTATE_DOT = re.compile(
+    r"(?i)\.\s*(SetHealth|SetMaxHealth|SetArmor|Kill|Remove|Kick|Ban|StripWeapons|Give|"
+    r"SetPos|SetTeam|SetModel|SetVelocity|God|Freeze|Spawn|Disconnect|ConCommand|SendLua|"
+    r"SetPData|Fire|Input|EmitSound|Ignite|TakeDamage|SetMoveType|SetNW\w*|Write|Append|Delete|"
+    r"CreateDir|Rename|Create|Run|Destroy)\s*\(")
+
+CONSOLE_READ_ONLY = (
+    re.compile(r"(?i)\s*(status|stats|version|uptime)\s*"),
+    re.compile(r"(?i)\s*(cvarlist|find|help|maps)(?:\s+[^\r\n;]*)?\s*"),
+    re.compile(r"(?i)\s*meta\s+(list|version)\s*"),
+)
+
 
 def _strip_lua(code):
     """Remove comments and string literals so the classifier sees only executable tokens."""
@@ -1331,14 +2134,14 @@ def _strip_lua(code):
 
 
 def classify_console(cmd):
+    if any(c in cmd for c in ("\r", "\n", ";")):
+        return "multiple console commands are not on the read-only allowlist"
     m = DESTRUCTIVE_CMD.search(cmd)
     if m:
         return ("destructive console verb '%s'" % m.group(1))
-    if cmd.strip().lower().startswith("lua_run"):
-        m = LUA_MUTATE.search(_strip_lua(cmd))
-        if m:
-            return ("mutating lua in lua_run (%s)" % m.group(0))
-    return None
+    if any(p.fullmatch(cmd) for p in CONSOLE_READ_ONLY):
+        return None
+    return "command is not on the explicit read-only console allowlist"
 
 
 def classify_lua(code):
@@ -1347,6 +2150,9 @@ def classify_lua(code):
     m = LUA_MUTATE.search(s)
     if m:
         return ("mutating call '%s'" % m.group(0), "mutate")
+    m = LUA_MUTATE_DOT.search(s)
+    if m:
+        return ("mutating dot-call '%s'" % m.group(1), "mutate")
     m = LUA_OPAQUE.search(s)
     if m:
         return ("opaque/indirect call '%s'" % m.group(0).strip(), "opaque")
@@ -1367,7 +2173,7 @@ def tool_status(args):
             continue
         tag = s["logical"].upper()
         if not s["running"]:
-            lines.append("  %-6s  DOWN    uuid=%s  (%s)" % (tag, s["uuid"][:8], s.get("hostname") or "?"))
+            lines.append("  %-6s  DOWN" % tag)
             continue
         players, maxpl, is_live = live_info(s)
         thr = LIVE_THRESHOLD.get(s["logical"], "?")
@@ -1380,8 +2186,6 @@ def tool_status(args):
         cap = "condebug" if s["condebug"] else "NO-condebug(blind)"
         lines.append("  %-6s  UP  %-22s  %-22s  port=%s  %s" % (
             tag, pc, live_s, s.get("port"), cap))
-        if s.get("hostname"):
-            lines.append("          %s" % s["hostname"])
     lines.append("")
     if LIVE_THRESHOLD:
         lines.append("Live thresholds: " + ", ".join(
@@ -1574,9 +2378,7 @@ end
 local _P, _F = 0, 0
 local _fb, _fcap = 0, false
 local _section = ""
-local _HNAMES = { "SECTION","CHECK","EQ","NEQ","NEAR","TRUE","FALSE","OK","THROWS","DUMP","LOG","MCP_DONE" }
-local _saved = {}
-for _, k in ipairs(_HNAMES) do _saved[k] = rawget(_G, k) end
+local _scratch = {}
 
 local function _tag(m) if _section ~= "" then return "[" .. _section .. "] " .. tostring(m or "?") end return tostring(m or "?") end
 local function _record(pass, failtext)
@@ -1601,21 +2403,21 @@ local function _record(pass, failtext)
   return pass
 end
 
-SECTION = function(name) _section = tostring(name or "") end
-CHECK   = function(c, m) return _record(c and true or false, _tag(m)) end
-EQ      = function(a, b, m) return _record(a == b, _tag(m) .. "  got=" .. _ser(a) .. " want=" .. _ser(b)) end
-NEQ     = function(a, b, m) return _record(a ~= b, _tag(m) .. "  both=" .. _ser(a)) end
-NEAR    = function(a, b, eps, m)
+_scratch.SECTION = function(name) _section = tostring(name or "") end
+_scratch.CHECK   = function(c, m) return _record(c and true or false, _tag(m)) end
+_scratch.EQ      = function(a, b, m) return _record(a == b, _tag(m) .. "  got=" .. _ser(a) .. " want=" .. _ser(b)) end
+_scratch.NEQ     = function(a, b, m) return _record(a ~= b, _tag(m) .. "  both=" .. _ser(a)) end
+_scratch.NEAR    = function(a, b, eps, m)
   eps = eps or 1e-6
   local ok = (type(a) == "number" and type(b) == "number" and math.abs(a - b) <= eps)
   return _record(ok, _tag(m) .. "  got=" .. _ser(a) .. " want~=" .. _ser(b) .. " eps=" .. _ser(eps))
 end
-TRUE    = function(v, m) return _record(v == true,  _tag(m) .. "  got=" .. _ser(v)) end
-FALSE   = function(v, m) return _record(v == false, _tag(m) .. "  got=" .. _ser(v)) end
-OK      = function(v, m) return _record(v ~= nil and v ~= false, _tag(m) .. "  got=" .. _ser(v)) end
-THROWS  = function(fn, m) local ok, e = pcall(fn); _record(not ok, _tag(m) .. "  did not throw"); return e end
-DUMP    = function(v) return _ser(v) end
-LOG     = function(...)
+_scratch.TRUE    = function(v, m) return _record(v == true,  _tag(m) .. "  got=" .. _ser(v)) end
+_scratch.FALSE   = function(v, m) return _record(v == false, _tag(m) .. "  got=" .. _ser(v)) end
+_scratch.OK      = function(v, m) return _record(v ~= nil and v ~= false, _tag(m) .. "  got=" .. _ser(v)) end
+_scratch.THROWS  = function(fn, m) local ok, e = pcall(fn); _record(not ok, _tag(m) .. "  did not throw"); return e end
+_scratch.DUMP    = function(v) return _ser(v) end
+_scratch.LOG     = function(...)
   local nn = select("#", ...); local t = {}
   for i = 1, nn do local x = select(i, ...); t[i] = (type(x) == "string") and x or _ser(x) end
   _LOGLINE(table.concat(t, "\t"))
@@ -1629,16 +2431,14 @@ local function _finalize(kind)
   _emit(kind)
   pcall(file.CreateDir, "_mcp")
   pcall(file.Write, "_mcp/" .. _T .. ".txt", table.concat(_BUF, "\n"))
-  for _, k in ipairs(_HNAMES) do _G[k] = _saved[k] end
 end
-MCP_DONE = function() _finalize("DON") end
+_scratch.MCP_DONE = function() _finalize("DON") end
 
 -- sandbox env: body global READS fall through to _G; body global WRITES go to a
 -- scratch table => zero _G pollution from the body's own globals (no cleanup needed).
-local _scratch = {}
 -- capture body print/Msg/MsgN as framed OUT lines (clean separation from other
 -- players' live console spam, which the driver drops as unframed noise).
-_scratch.print = function(...) LOG(...) end
+_scratch.print = function(...) _scratch.LOG(...) end
 _scratch.MsgN  = function(...)
   local nn = select("#", ...); local t = {}
   for i = 1, nn do t[i] = tostring((select(i, ...))) end
@@ -1669,15 +2469,19 @@ if type(_chunk) ~= "function" then
 end
 if setfenv then setfenv(_chunk, _env) end
 
+local _oldhook, _oldmask, _oldcount = debug.gethook()
+local function _restorehook()
+  if _oldhook then debug.sethook(_oldhook, _oldmask, _oldcount) else debug.sethook() end
+end
 local _ins = 0
 debug.sethook(function()
   _ins = _ins + 1
-  if _ins > 200 then debug.sethook(); error("[mcp] instruction budget exceeded (runaway loop?)", 2) end
+  if _ins > 200 then _restorehook(); error("[mcp] instruction budget exceeded (runaway loop?)", 2) end
 end, "", 100000)
 local _ok, _cnt, _vals = _pack(xpcall(_chunk, function(e)
   return tostring(e) .. "\n" .. debug.traceback("", 2)
 end))
-debug.sethook()
+_restorehook()
 
 if _ok then
   if _cnt == 1 then
@@ -1691,9 +2495,11 @@ else
   _emit("ERR", tostring(_vals[1]))
 end
 
-if _ASYNC and not _finalized then
+if _ASYNC and _ok and not _finalized then
   -- async: wait for the body's MCP_DONE() callback (driver waits async_timeout for DON)
 else
+  -- Synchronous compile/runtime/setup failures cannot ever call MCP_DONE().
+  -- Finalize them immediately even when the caller requested async capture.
   _finalize("END")
 end
 '''
@@ -1724,13 +2530,14 @@ def tool_lua(args):
     if "~|~" in code or "__MCP" in code:
         return ("code may not contain the reserved markers '~|~' or '__MCP'", True)
     reason, band = classify_lua(code)
-    if reason:
-        if band == "opaque":
-            reason += " (cannot statically prove read-only)"
-        blocked = _confirm_gate(server, srv, reason, args)
-        if blocked:
-            log_event({"ev": "lua_blocked", "server": server, "reason": reason, "band": band, "code": code[:200]})
-            return (blocked, True)
+    gate_reason = reason or "arbitrary server-side Lua cannot be statically proven read-only"
+    if band == "opaque":
+        gate_reason += " (indirect/obfuscated call)"
+    blocked = _confirm_gate(server, srv, gate_reason, args)
+    if blocked:
+        log_event({"ev": "lua_blocked", "server": server, "reason": gate_reason,
+                   "band": band or "arbitrary", "code": code})
+        return (blocked, True)
     want_async = bool(args.get("async"))
     atimeout = int(args.get("async_timeout", 20))
     tok = os.urandom(8).hex()
@@ -1777,7 +2584,7 @@ def tool_lua(args):
     if not any([summ, err, out, ret]):
         parts.append("(no output / suite produced nothing)")
 
-    is_error = (err is not None) or (nf > 0) or bool(started and not ended)
+    is_error = (err is not None) or (nf > 0) or (not bool(started)) or (not bool(ended))
     return ("\n".join(parts), is_error)
 
 
@@ -1797,15 +2604,27 @@ def tool_fetch(args):
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     what = args.get("what", "console")
     save_to = args.get("save_to")
+    if save_to:
+        if what != "file":
+            return ("save_to is only valid with what='file'.", True)
+        if not os.path.isabs(save_to):
+            return ("save_to must be an absolute local path.", True)
+        if args.get("confirm") is not True:
+            return ("BLOCKED: save the remote file into the requested LOCAL path. Re-call with "
+                    "confirm=true. No remote read or local write was performed.", True)
 
-    if what in ("dir", "hash", "backups"):
+    if what in ("dir", "hash", "backups", "history"):
         req = {"op": "fetch", "uuid": srv["uuid"], "what": what, "path": args.get("path", "")}
+        if what == "history":
+            req.update(lines=args.get("lines", 20), before=args.get("before"))
         if what == "hash" and args.get("glob"):
             req["glob"] = args["glob"]
         res = run_driver(req, timeout=90)
         log_event({"ev": "fetch", "server": server, "what": what, "ok": res.get("ok")})
         if not res.get("ok"):
             return ("fetch failed: %s" % res.get("error"), True)
+        if what == "history":
+            return (json.dumps(res, ensure_ascii=False, indent=2), False)
         if what == "dir":
             ents = res.get("entries", [])
             out = ["[%s] dir garrysmod/%s — %d entries%s" % (
@@ -1819,7 +2638,7 @@ def tool_fetch(args):
             return ("\n".join(out), False)
         if what == "hash":
             files = res.get("files", {})
-            out = ["[%s] sha1 garrysmod/%s (glob=%s) — %d file(s)%s" % (
+            out = ["[%s] sha256 garrysmod/%s (glob=%s) — %d file(s)%s" % (
                 server.upper(), args.get("path", ""), args.get("glob") or "*",
                 res.get("count", len(files)),
                 "  [capped at 2000 — narrow path/glob]" if res.get("truncated") else "")]
@@ -1836,12 +2655,16 @@ def tool_fetch(args):
             if omitted:
                 out.append("  ...[%d of %d entries omitted at 48KB — narrow path/glob for a complete compare]"
                            % (omitted, len(files)))
+            if res.get("skipped_escaped"):
+                out.append("  [%d symlink target(s) escaped garrysmod/ and were not read]" %
+                           res["skipped_escaped"])
+            out.append("TIP: when several hashes differ, compare them in ONE srcds_diff files=[...] batch, not separate calls.")
             return ("\n".join(out), False)
         baks = res.get("backups", [])
-        out = ["[%s] deploy backups (latest per path; roll back via srcds_deploy restore:true) — %d%s" % (
+        out = ["[%s] deploy backups (restore requires expected_sha256 and explicit backup_id) — %d%s" % (
             server.upper(), len(baks), " (capped at 500)" if res.get("truncated") else "")]
         for b in baks:
-            out.append("  %-60s %9s  %s" % (b["path"], b["size"], _fmt_mtime(b["mtime"])))
+            out.append("  %s  %s  %9s  %s" % (b.get("backup_id", "legacy"), b["path"], b["size"], _fmt_mtime(b["mtime"])))
         return ("\n".join(out), False)
 
     req = {"op": "fetch", "uuid": srv["uuid"], "what": what,
@@ -1863,7 +2686,7 @@ def tool_fetch(args):
         return ("fetch failed: %s" % res.get("error"), True)
     if save_to and what == "file":
         try:
-            data = base64.b64decode(res.get("content_b64") or "")
+            data = base64.b64decode(res.get("content_b64") or "", validate=True)
         except Exception as e:
             return ("bad download transfer: %s" % e, True)
         if os.path.exists(save_to) and args.get("overwrite") is not True:
@@ -1876,10 +2699,12 @@ def tool_fetch(args):
                 f.write(data)
         except OSError as e:
             return ("could not write %s: %s" % (save_to, e), True)
-        return ("[%s] downloaded garrysmod/%s -> %s (%d bytes, sha1=%s, binary-safe)"
+        return ("[%s] downloaded garrysmod/%s -> %s (%d bytes, sha256=%s, binary-safe)"
                 % (server.upper(), args.get("path", ""), save_to, len(data),
-                   hashlib.sha1(data).hexdigest()[:12]), False)
+                   hashlib.sha256(data).hexdigest()), False)
     hdr = "[%s] %s (%s)" % (server.upper(), what, res.get("path", ""))
+    if res.get("sha256"):
+        hdr += "\nfull_file_sha256=" + res["sha256"] + " (text below may be filtered or tailed)"
     if res.get("truncated"):
         hdr += "  [byte-capped -> showing most recent; raise maxbytes or narrow via grep/lines for more]"
     return ("%s\n%s" % (hdr, res.get("content", "")), False)
@@ -1889,6 +2714,9 @@ PANEL_URL = CFG.get("panel_url") or ""
 
 
 DEPLOY_BATCH_MAX = 400          # sanity cap; a whole addon fits comfortably
+DIFF_BATCH_MAX = 200
+DIFF_BATCH_DEFAULT_MAXBYTES = 48000
+DIFF_BATCH_MAXBYTES = 200000
 
 # Anti-trickle nudge: an LLM that uploads N files as N single-file calls burns a
 # confirm + an SSH round-trip per file. Count DISTINCT paths single-deployed per
@@ -1898,6 +2726,7 @@ DEPLOY_BATCH_MAX = 400          # sanity cap; a whole addon fits comfortably
 SINGLE_TRICKLE_WINDOW = 240.0   # seconds
 SINGLE_TRICKLE_AT = 3           # distinct files before the nudge fires
 _recent_singles = {}            # server -> {to: last_deploy_time}
+_recent_diff_singles = {}       # (server, comparison kind) -> {path: last_diff_time}
 
 
 def _trickle_note(server, to, record):
@@ -1915,208 +2744,349 @@ def _trickle_note(server, to, record):
     return ""
 
 
+def _diff_trickle_note(server, against, path, record):
+    now = time.time()
+    key = (server, against)
+    h = _recent_diff_singles.setdefault(key, {})
+    for k in [k for k, t in h.items() if now - t >= SINGLE_TRICKLE_WINDOW]:
+        del h[k]
+    if record:
+        h[path] = now
+    n = len(h) + (0 if (record or path in h) else 1)
+    if n >= SINGLE_TRICKLE_AT:
+        return ("\nTIP: %d different files diffed one-by-one in the last %d min — send them as ONE "
+                "srcds_diff call with files:[{path, local|path_b}, ...] (one SSH round-trip)."
+                % (n, int(SINGLE_TRICKLE_WINDOW // 60)))
+    return ""
+
+
 def _bad_deploy_to(to):
     return (not to) or to.startswith("/") or ":" in to or ".." in to.replace("\\", "/").split("/")
 
 
-def _deploy_batch(server, srv, args, files):
-    if args.get("to") or args.get("local") or ("content" in args):
-        return ("give EITHER 'files' (batch) OR top-level to/local/content (single), not both.", True)
-    if not isinstance(files, list) or not files:
-        return ("'files' must be a non-empty array of {to, local|content} objects.", True)
-    if len(files) > DEPLOY_BATCH_MAX:
-        return ("batch too large: %d files (max %d). Split into several calls." % (len(files), DEPLOY_BATCH_MAX), True)
-    restore = args.get("restore") is True
-    entries, seen = [], set()
-    for i, f in enumerate(files):
-        if not isinstance(f, dict):
-            return ("files[%d] is not an object." % i, True)
-        to = (f.get("to") or "").strip()
-        if _bad_deploy_to(to):
-            return ("files[%d]: invalid 'to' (%r): give a path relative to garrysmod/ with no '..' or drive/absolute prefix." % (i, f.get("to")), True)
-        key = to.replace("\\", "/")
-        if key in seen:
-            # a duplicate would make the 2nd write back up the batch's own 1st
-            # write, silently destroying the pre-deploy backup for that path
-            return ("files[%d]: duplicate 'to' %s — each path may appear only once per batch." % (i, to), True)
-        seen.add(key)
-        if restore:
-            entries.append({"to": to})
-            continue
-        has_local = bool(f.get("local")); has_content = "content" in f
-        if has_local == has_content:
-            return ("files[%d] (%s): provide exactly one of 'local' or 'content'." % (i, to), True)
-        if has_local:
-            try:
-                with open(f["local"], "rb") as fh:
-                    data = fh.read()
-            except OSError as e:
-                return ("files[%d] (%s): could not read local file: %s. Nothing was deployed." % (i, to, e), True)
-        else:
-            data = (f["content"] or "").encode("utf-8")
-        entries.append({"to": to, "content_b64": base64.b64encode(data).decode(), "bytes": len(data)})
-    total = sum(e.get("bytes", 0) for e in entries)
-    if args.get("confirm") is not True:
-        players, maxpl, is_live = live_info(srv)
-        ln = ("  (%d/%s players%s)" % (players, maxpl, " — LIVE" if is_live else "")) if players is not None else ""
-        head = (("BLOCKED: batch-restore %d files on %s from their deploy backups.%s" % (len(entries), server, ln))
-                if restore else
-                ("BLOCKED: batch-deploy %d files (%d bytes total) -> %s:garrysmod/.%s" % (len(entries), total, server, ln)))
-        listing = "\n".join("  " + e["to"] for e in entries[:12])
-        if len(entries) > 12:
-            listing += "\n  ...and %d more" % (len(entries) - 12)
-        return ("%s Re-call with confirm=true. Nothing was written.\n%s" % (head, listing), True)
-    req = {"op": "deploy", "uuid": srv["uuid"], "backup": args.get("backup", True),
-           "files": [{k: e[k] for k in ("to", "content_b64") if k in e} for e in entries]}
-    if restore:
-        req["restore"] = True
-    res = run_driver(req, timeout=min(240, 60 + 2 * len(entries)))
-    log_event({"ev": "deploy_batch", "server": server, "files": len(entries), "bytes": total,
-               "restore": restore, "ok": res.get("ok"), "n_fail": res.get("n_fail")})
-    if not res.get("ok"):
-        return ("batch deploy failed: %s" % res.get("error"), True)
-    results = res.get("results") or []
-    n_ok, n_fail = res.get("n_ok", 0), res.get("n_fail", 0)
-    # Token-lean output: the caller already knows the file list it sent, so a clean
-    # batch gets ONE summary line; only failures are itemized (those are news).
-    n_over = sum(1 for r in results if r.get("ok") and r.get("overwrote"))
-    n_bak = sum(1 for r in results if r.get("ok") and r.get("backup"))
-    if restore:
-        verb, detail = "batch-RESTORED", "backups kept, restoring again stays possible"
-    else:
-        verb = "batch-deployed"
-        detail = "%d overwrote (%d backed up), %d new" % (n_over, n_bak, n_ok - n_over)
-    msg = "[%s] %s %d/%d files, %dB total — %s" % (
-        server.upper(), verb, n_ok, len(results), res.get("bytes", 0), detail)
-    fails = ["  FAILED  %s — %s" % (r.get("to"), r.get("error")) for r in results if not r.get("ok")]
-    if fails:
-        if len(fails) > 25:
-            fails = fails[:25] + ["  ...and %d more FAILED" % (len(fails) - 25)]
-        msg += "\n" + "\n".join(fails)
-        if n_ok:
-            msg += "\n(the %d OK files ARE written — fix and re-send only the failed ones)" % n_ok
-    if not srv.get("running"):
-        msg += "\n(server is DOWN — loads on next boot)"
-    elif any(r.get("ok") and (r.get("to") or "").endswith(".lua") for r in results):
-        msg += "\n(.lua — autorefresh reloads in ~2s; verify with srcds_lua)"
-    _recent_singles.pop(server, None)   # they batched — reset the trickle nudge
-    return (msg, n_fail > 0)
+def _read_local_capped(path, cap):
+    """Read at most cap+1 bytes so a changing/huge local file stays bounded."""
+    try:
+        size = os.path.getsize(path)
+        if size > cap:
+            return None, "local file is %d bytes (> %d cap)" % (size, cap)
+        with open(path, "rb") as fh:
+            data = fh.read(cap + 1)
+    except (OSError, TypeError, ValueError) as e:
+        return None, "could not read local file: %s" % e
+    if len(data) > cap:
+        return None, "local file grew beyond the %d-byte cap while being read" % cap
+    return data, None
 
 
 def tool_deploy(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    if args.get("files") is not None:
-        srv = resolve(server)
-        if not srv:
-            return ("could not resolve server '%s' (host unreachable?)" % server, True)
-        return _deploy_batch(server, srv, args, args.get("files"))
-    to = (args.get("to") or "").strip()
-    if _bad_deploy_to(to):
-        return ("invalid 'to': give a path relative to garrysmod/ with no '..' or drive/absolute prefix.", True)
-    srv = resolve(server)
-    if not srv:
-        return ("could not resolve server '%s' (host unreachable?)" % server, True)
-    if args.get("restore") is True:
-        if args.get("confirm") is not True:
-            return ("BLOCKED: restore the last deploy backup over %s:garrysmod/%s. "
-                    "Re-call with confirm=true. Nothing was written." % (server, to), True)
-        res = run_driver({"op": "deploy", "uuid": srv["uuid"], "to": to, "restore": True}, timeout=45)
-        log_event({"ev": "deploy_restore", "server": server, "to": to, "ok": res.get("ok")})
-        if not res.get("ok"):
-            return ("restore failed: %s" % res.get("error"), True)
-        msg = ("[%s] RESTORED garrysmod/%s from its deploy backup (%d bytes). "
-               "The backup is kept, so restoring again stays possible." % (server.upper(), to, res.get("bytes")))
-        if to.endswith(".lua") and srv.get("running"):
-            msg += "\n(.lua — autorefresh reloads it in ~2s; verify with srcds_lua)"
-        return (msg, False)
-    if args.get("local"):
-        try:
-            with open(args["local"], "rb") as f:
-                data = f.read()
-        except OSError as e:
-            return ("could not read local file: %s" % e, True)
-    elif "content" in args:
-        data = (args["content"] or "").encode("utf-8")
-    else:
-        return ("provide either 'local' (a local file path) or 'content' (inline string).", True)
+    batch = args.get("files") is not None
+    if batch and any(k in args for k in ("to", "local", "content", "expected_sha256", "backup_id")):
+        return ("give files OR top-level to/local/content/expected_sha256/backup_id, not both", True)
+    files = args.get("files") if batch else [args]
+    if not isinstance(files, list) or not files or len(files) > DEPLOY_BATCH_MAX:
+        return ("files must contain 1-%d entries" % DEPLOY_BATCH_MAX, True)
+    if args.get("backup", True) is not True:
+        return ("versioned backups are mandatory; backup=false is no longer supported", True)
     if args.get("confirm") is not True:
-        players, maxpl, is_live = live_info(srv)
-        ln = ("  (%d/%s players%s)" % (players, maxpl, " — LIVE" if is_live else "")) if players is not None else ""
-        return ("BLOCKED: deploy %d bytes -> %s:garrysmod/%s%s. Re-call with confirm=true. Nothing was written.%s"
-                % (len(data), server, to, ln, _trickle_note(server, to, record=False)), True)
-    res = run_driver({"op": "deploy", "uuid": srv["uuid"], "to": to,
-                      "content_b64": base64.b64encode(data).decode(),
-                      "backup": args.get("backup", True)}, timeout=45)
-    log_event({"ev": "deploy", "server": server, "to": to, "bytes": len(data), "ok": res.get("ok")})
-    if not res.get("ok"):
-        return ("deploy failed: %s" % res.get("error"), True)
-    msg = "[%s] deployed %d bytes -> garrysmod/%s" % (server.upper(), res.get("bytes"), to)
-    if res.get("backup"):
-        msg += "  (overwrote; backup at %s)" % res["backup"]
-    elif res.get("overwrote"):
-        msg += "  (overwrote, no backup)"
+        return ("BLOCKED: deployment/restore requires confirm=true. Nothing was written.", True)
+    restore = args.get("restore") is True
+    revision = args.get("source_revision") or ""
+    if revision and (not isinstance(revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision) is None):
+        return ("source_revision must be a full 40- or 64-character Git object hash", True)
+    entries, seen, total = [], set(), 0
+    for i, f in enumerate(files):
+        if not isinstance(f, dict):
+            return ("files[%d] must be an object" % i, True)
+        to = f.get("to")
+        if (not isinstance(to, str) or _bad_deploy_to(to) or "\\" in to or "\x00" in to
+                or any(p in ("", ".", "..") for p in to.split("/"))):
+            return ("files[%d]: invalid garrysmod-relative destination; use '/' separators and no dot components" % i, True)
+        if to in seen:
+            return ("duplicate destination: " + to, True)
+        seen.add(to)
+        expected = f.get("expected_sha256")
+        if not isinstance(expected, str) or (expected != "missing" and re.fullmatch(r"[0-9a-f]{64}", expected) is None):
+            return ("STALE_BASE_REQUIRED: %s needs expected_sha256 from the original remote file used as the edit base, or 'missing' for creation. Re-fetch and reconcile stale edits; never attach a fresh hash to old content." % to, True)
+        entry = {"to": to, "expected_sha256": expected}
+        if restore:
+            if "content" in f or "local" in f:
+                return ("restore accepts no local/content payload", True)
+            backup_id = f.get("backup_id")
+            if not isinstance(backup_id, str) or (backup_id != "legacy" and re.fullmatch(r"[0-9]{20}-[0-9a-f]{16}", backup_id) is None):
+                return ("restore requires explicit backup_id from fetch history/backups, or 'legacy'", True)
+            entry.update(backup_id=backup_id, source_path="backup:" + backup_id)
+        else:
+            if "backup_id" in f:
+                return ("backup_id is only valid for restore", True)
+            has_local, has_content = bool(f.get("local")), "content" in f
+            if has_local == has_content:
+                return ("%s: provide exactly one of local or content" % to, True)
+            if has_local:
+                data, err = _read_local_capped(f["local"], DEPLOY_FILE_MAX_BYTES)
+                if err:
+                    return ("%s: %s; nothing deployed" % (to, err), True)
+                entry["source_path"] = os.path.abspath(f["local"])
+            else:
+                if not isinstance(f["content"], str):
+                    return ("content must be a string", True)
+                data = f["content"].encode("utf-8")
+                entry["source_path"] = "inline"
+            total += len(data)
+            if len(data) > DEPLOY_FILE_MAX_BYTES or total > DEPLOY_BATCH_MAX_INPUT_BYTES:
+                return ("deploy file or aggregate payload cap exceeded; nothing deployed", True)
+            entry["content_b64"] = base64.b64encode(data).decode()
+        entries.append(entry)
+    # Never select a stale cached or first-of-many target for a write.
+    srv = resolve(server, fresh=True)
+    if not srv:
+        return ("DEPLOY_TARGET_CHANGED_OR_AMBIGUOUS: fresh discovery failed or did not resolve exactly one server; nothing deployed", True)
+    req = {"op": "deploy", "server": server, "uuid": srv["uuid"], "restore": restore,
+           "origin": {"client_instance": _CLIENT_INSTANCE, "pid": os.getpid(), "tool_version": MCP_VERSION,
+                      "thread_id": os.environ.get("CODEX_THREAD_ID", ""), "source_revision": revision}}
+    if batch:
+        req["files"] = entries
     else:
-        msg += "  (new file)"
-    if not srv.get("running"):
-        msg += "\n(server is DOWN — loads on next boot)"
-    elif to.endswith(".lua"):
-        msg += "\n(.lua — autorefresh reloads it in ~2s; verify with srcds_lua)"
-    msg += _trickle_note(server, to, record=True)
+        req.update(entries[0])
+    res = run_driver(req, timeout=min(240, 60 + 2 * len(entries)))
+    log_event({"ev": "deploy_v2", "server": server, "deployment_id": res.get("deployment_id"),
+               "files": len(entries), "bytes": total, "restore": restore, "ok": res.get("ok"),
+               "n_fail": res.get("n_fail"), "outcome": res.get("outcome")})
+    deploy_id = res.get("deployment_id") or "unavailable"
+    if not res.get("ok"):
+        msg = "deployment %s failed: %s" % (deploy_id, res.get("error"))
+        for c in res.get("conflicts", []):
+            msg += "\n%s: expected=%s actual=%s" % (c["to"], c["expected_sha256"], c["actual_sha256"])
+        if res.get("outcome") == "partial_or_uncertain" or not res.get("deployment_id"):
+            msg += "\nInspect fetch what='history' and live hashes before retrying; files may already have changed."
+        return (msg, True)
+    results = res.get("results") or [res]
+    msg = "[%s] %s %d file(s), %d changed bytes; deployment_id=%s" % (
+        server.upper(), "restored" if restore else "deployed", len(results), res.get("bytes", 0), deploy_id)
+    for r in results:
+        msg += "\n%s: sha256=%s%s%s" % (r.get("to"), r.get("after_sha256"),
+               " (unchanged)" if r.get("noop") else "",
+               " backup_id=" + r["backup_id"] if r.get("backup_id") else "")
+    if any(e["to"].endswith(".lua") for e in entries):
+        msg += "\nSource bytes verified; runtime reload and client behavior still require verification."
     return (msg, False)
+
 
 
 def tool_grep(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    pattern = args.get("pattern") or ""
-    if not pattern.strip():
-        return ("pattern is empty", True)
+    patterns = []
+    if args.get("pattern") is not None:
+        patterns.append(args.get("pattern"))
+    if args.get("patterns") is not None:
+        if not isinstance(args["patterns"], list):
+            return ("patterns must be an array of regex strings.", True)
+        patterns.extend(args["patterns"])
+    if not patterns or any(not isinstance(p, str) or not p.strip() for p in patterns):
+        return ("provide at least one non-empty pattern or patterns[] entry.", True)
+    if len(patterns) > GREP_MAX_PATTERNS:
+        return ("too many grep patterns (%d; max %d)." % (len(patterns), GREP_MAX_PATTERNS), True)
+    globs = []
+    if args.get("glob") is not None:
+        globs.append(args.get("glob"))
+    if args.get("globs") is not None:
+        if not isinstance(args["globs"], list):
+            return ("globs must be an array of filename globs.", True)
+        globs.extend(args["globs"])
+    if not globs:
+        globs = ["*.lua"]
+    exclude_globs = args.get("exclude_globs") or []
+    if not isinstance(exclude_globs, list):
+        return ("exclude_globs must be an array.", True)
+    if any(not isinstance(g, str) or not g for g in globs + exclude_globs):
+        return ("all include/exclude globs must be non-empty strings.", True)
+    if len(globs) + len(exclude_globs) > GREP_MAX_GLOBS:
+        return ("too many grep globs (%d; max %d total)." %
+                (len(globs) + len(exclude_globs), GREP_MAX_GLOBS), True)
+    paths = []
+    if args.get("path") is not None:
+        paths.append(args.get("path"))
+    if args.get("paths") is not None:
+        if not isinstance(args["paths"], list):
+            return ("paths must be an array of paths relative to garrysmod/.", True)
+        paths.extend(args["paths"])
+    if not paths:
+        paths = [""]
+    if any(not isinstance(p, str) for p in paths) or len(paths) > GREP_MAX_PATHS:
+        return ("invalid paths[] (max %d string roots)." % GREP_MAX_PATHS, True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
-    glob = args.get("glob") or "*.lua"
-    path = args.get("path") or ""
-    res = run_driver({"op": "grep", "uuid": srv["uuid"], "pattern": pattern,
-                      "path": path, "glob": glob, "max": int(args.get("max", 200))}, timeout=40)
-    log_event({"ev": "grep", "server": server, "pattern": pattern[:120], "ok": res.get("ok")})
+    res = run_driver({"op": "grep", "uuid": srv["uuid"], "patterns": patterns,
+                      "paths": paths, "globs": globs, "exclude_globs": exclude_globs,
+                      "max": int(args.get("max", 200))}, timeout=40)
+    log_event({"ev": "grep", "server": server, "pattern": "\n".join(patterns),
+               "paths": len(paths), "globs": len(globs), "ok": res.get("ok")})
     if not res.get("ok"):
         return ("grep failed: %s" % res.get("error"), True)
     total, shown = res.get("total", 0), res.get("shown", 0)
-    head = "[%s] grep '%s' in %s/%s — %d match(es)%s" % (
-        server.upper(), pattern, (path or "."), glob, total,
-        ("" if total <= shown else " (showing first %d)" % shown))
+    total_text = str(total) if res.get("total_exact", True) else (">=%d" % total)
+    head = "[%s] grep — %s captured match(es), %d pattern(s), %d include glob(s), %d root(s)%s" % (
+        server.upper(), total_text, len(patterns), len(globs), len(paths),
+        ("" if total <= shown and not res.get("truncated") else " (showing %d)" % shown))
     if res.get("note"):
         head += "  [%s]" % res["note"]
     matches = res.get("matches", [])
     return (head + ("\n" + "\n".join(matches) if matches else ""), False)
 
 
+def _format_diff_result(req, res):
+    head = "[diff] %s  vs  %s" % (req["label_a"], req["label_b"])
+    head += "\nsha256_a=%s sha256_b=%s\n" % (res.get("sha256_a"), res.get("sha256_b"))
+    if res.get("equal"):
+        return head + " — IDENTICAL (%s bytes, sha1 %s)" % (res.get("size_a"), res.get("sha_a"))
+    if res.get("binary"):
+        return head + " — BINARY files DIFFER: %s vs %s bytes (sha1 %s vs %s)" % (
+            res.get("size_a"), res.get("size_b"), res.get("sha_a"), res.get("sha_b"))
+    cap = "  [truncated by output budget]" if res.get("truncated") else ""
+    diff = res.get("diff", "")
+    if not diff:
+        diff = "[no textual diff rendered; sha1 %s vs %s]" % (res.get("sha_a"), res.get("sha_b"))
+    return head + " — DIFFER (%s vs %s bytes)%s\n%s" % (
+        res.get("size_a"), res.get("size_b"), cap, diff)
+
+
+def _diff_local_entry(server, srv, path, local, context):
+    data, err = _read_local_capped(local, DIFF_FILE_MAX_BYTES)
+    if err:
+        return None, err.replace(" cap", " diff cap")
+    return ({"uuid_a": srv["uuid"], "path_a": path,
+             "label_a": "%s:%s" % (server, path),
+             "content_b64": base64.b64encode(data).decode(),
+             "label_b": "local:%s" % os.path.basename(local), "context": context,
+             "_local_bytes": len(data)}, None)
+
+
+def _diff_server_entry(server, srv, path, server_b, srv_b, path_b, context):
+    return {"uuid_a": srv["uuid"], "path_a": path,
+            "label_a": "%s:%s" % (server, path),
+            "uuid_b": srv_b["uuid"], "path_b": path_b,
+            "label_b": "%s:%s" % (server_b, path_b), "context": context}
+
+
+def _diff_batch(server, srv, args, files):
+    if args.get("path") or args.get("path_b") or args.get("local"):
+        return ("give EITHER 'files' (batch) OR top-level path/path_b/local (single), not both.", True)
+    if not isinstance(files, list) or not files:
+        return ("'files' must be a non-empty array of {path, local|path_b} objects.", True)
+    if len(files) > DIFF_BATCH_MAX:
+        return ("batch too large: %d files (max %d). Split into several calls."
+                % (len(files), DIFF_BATCH_MAX), True)
+    context = max(0, min(int(args.get("context", 3)), 100))
+    server_b = args.get("server_b")
+    srv_b = None
+    if server_b:
+        if server_b not in SERVER_NAMES:
+            return ("server_b must be one of: %s" % ", ".join(SERVER_NAMES), True)
+        srv_b = resolve(server_b)
+        if not srv_b:
+            return ("could not resolve server '%s' (host unreachable?)" % server_b, True)
+    elif args.get("confirm") is not True:
+        return ("BLOCKED: local batch diff reads local files and transmits their contents to the remote "
+                "comparison driver. Re-call with confirm=true to authorize that data transfer. Nothing was read.", True)
+    entries = []
+    local_input_bytes = 0
+    for i, f in enumerate(files):
+        if not isinstance(f, dict):
+            return ("files[%d] is not an object." % i, True)
+        path = (f.get("path") or "").strip()
+        if _bad_deploy_to(path):
+            return ("files[%d]: invalid 'path' (%r): give a path relative to garrysmod/."
+                    % (i, f.get("path")), True)
+        local = f.get("local")
+        path_b = (f.get("path_b") or path).strip()
+        if server_b:
+            if local:
+                return ("files[%d] (%s): omit 'local' when top-level server_b is set." % (i, path), True)
+            if _bad_deploy_to(path_b):
+                return ("files[%d]: invalid 'path_b' (%r): give a path relative to garrysmod/."
+                        % (i, f.get("path_b")), True)
+            entries.append(_diff_server_entry(server, srv, path, server_b, srv_b, path_b, context))
+        else:
+            if f.get("path_b"):
+                return ("files[%d] (%s): path_b requires top-level server_b." % (i, path), True)
+            if not local:
+                return ("files[%d] (%s): provide 'local', or set top-level server_b for server-to-server batch mode."
+                        % (i, path), True)
+            entry, err = _diff_local_entry(server, srv, path, local, context)
+            if err:
+                return ("files[%d] (%s): %s. No remote diff was run." % (i, path, err), True)
+            local_input_bytes += entry.pop("_local_bytes", 0)
+            if local_input_bytes > DIFF_BATCH_MAX_INPUT_BYTES:
+                return ("local batch input exceeds the %d-byte diff cap. No remote diff was run."
+                        % DIFF_BATCH_MAX_INPUT_BYTES, True)
+            entries.append(entry)
+    maxbytes = max(0, min(int(args.get("maxbytes", DIFF_BATCH_DEFAULT_MAXBYTES)), DIFF_BATCH_MAXBYTES))
+    res = run_driver({"op": "diff", "files": entries, "maxbytes": maxbytes},
+                     timeout=min(240, 60 + len(entries)))
+    log_event({"ev": "diff_batch", "server": server, "vs": (server_b or "local"),
+               "files": len(entries), "ok": res.get("ok"), "n_equal": res.get("n_equal"),
+               "n_differ": res.get("n_differ"), "n_fail": res.get("n_fail")})
+    if not res.get("ok"):
+        return ("batch diff failed: %s" % res.get("error"), True)
+    results = res.get("results") or []
+    n_equal = res.get("n_equal", 0)
+    n_differ = res.get("n_differ", 0)
+    n_fail = res.get("n_fail", 0)
+    msg = ("[batch diff] %s vs %s — %d files: %d IDENTICAL, %d DIFFER, %d FAILED; "
+           "one SSH round-trip" % (server, server_b or "local", len(entries), n_equal, n_differ, n_fail))
+    details = []
+    for i, entry in enumerate(entries):
+        if i >= len(results):
+            details.append("FAILED  %s  vs  %s — missing driver result" %
+                           (entry["label_a"], entry["label_b"]))
+            n_fail += 1
+            continue
+        item = results[i]
+        if not item.get("ok"):
+            details.append("FAILED  %s  vs  %s — %s" %
+                           (entry["label_a"], entry["label_b"], item.get("error")))
+        else:
+            details.append(_format_diff_result(entry, item))
+    if details:
+        msg += "\n\n" + "\n\n".join(details)
+    if res.get("n_truncated"):
+        msg += "\n%d differing diff(s) were truncated to the %d-byte aggregate output budget." % (
+            res["n_truncated"], res.get("maxbytes", maxbytes))
+    _recent_diff_singles.pop((server, server_b or "local"), None)
+    return (msg, n_fail > 0)
+
+
 def tool_diff(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    path = (args.get("path") or "").strip()
-    if not path:
-        return ("path is empty", True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
+    if args.get("files") is not None:
+        return _diff_batch(server, srv, args, args.get("files"))
+    path = (args.get("path") or "").strip()
+    if _bad_deploy_to(path):
+        return ("invalid 'path': give a path relative to garrysmod/ with no '..' or drive/absolute prefix.", True)
     server_b = args.get("server_b")
     local = args.get("local")
     if bool(server_b) == bool(local):
         return ("give exactly ONE of: server_b (compare against another server) or local (a local file path).", True)
-    req = {"op": "diff", "uuid_a": srv["uuid"], "path_a": path,
-           "label_a": "%s:%s" % (server, path), "context": int(args.get("context", 3))}
+    context = max(0, min(int(args.get("context", 3)), 100))
     if local:
-        try:
-            with open(local, "rb") as f:
-                req["content_b64"] = base64.b64encode(f.read()).decode()
-        except OSError as e:
-            return ("could not read local file: %s" % e, True)
-        req["label_b"] = "local:%s" % local
+        if args.get("confirm") is not True:
+            return ("BLOCKED: local diff reads a local file and transmits its contents to the remote comparison "
+                    "driver. Re-call with confirm=true to authorize that data transfer. Nothing was read.", True)
+        req, err = _diff_local_entry(server, srv, path, local, context)
+        if err:
+            return (err, True)
+        req.pop("_local_bytes", None)
     else:
         if server_b not in SERVER_NAMES:
             return ("server_b must be one of: %s" % ", ".join(SERVER_NAMES), True)
@@ -2124,23 +3094,17 @@ def tool_diff(args):
         if not srv_b:
             return ("could not resolve server '%s' (host unreachable?)" % server_b, True)
         path_b = (args.get("path_b") or path).strip()
-        req["uuid_b"] = srv_b["uuid"]
-        req["path_b"] = path_b
-        req["label_b"] = "%s:%s" % (server_b, path_b)
-    res = run_driver(req, timeout=60)
+        if _bad_deploy_to(path_b):
+            return ("invalid 'path_b': give a path relative to garrysmod/ with no '..' or drive/absolute prefix.", True)
+        req = _diff_server_entry(server, srv, path, server_b, srv_b, path_b, context)
+    res = run_driver(dict(req, op="diff"), timeout=60)
     log_event({"ev": "diff", "server": server, "path": path,
                "vs": (server_b or "local"), "ok": res.get("ok"), "equal": res.get("equal")})
     if not res.get("ok"):
         return ("diff failed: %s" % res.get("error"), True)
-    head = "[diff] %s  vs  %s" % (req["label_a"], req["label_b"])
-    if res.get("equal"):
-        return (head + " — IDENTICAL (%s bytes, sha1 %s)" % (res.get("size_a"), res.get("sha_a")), False)
-    if res.get("binary"):
-        return (head + " — BINARY files DIFFER: %s vs %s bytes (sha1 %s vs %s)" % (
-            res.get("size_a"), res.get("size_b"), res.get("sha_a"), res.get("sha_b")), False)
-    cap = "  [truncated at 40KB]" if res.get("truncated") else ""
-    return (head + " — DIFFER (%s vs %s bytes)%s\n%s" % (
-        res.get("size_a"), res.get("size_b"), cap, res.get("diff", "")), False)
+    msg = _format_diff_result(req, res)
+    msg += _diff_trickle_note(server, server_b or "local", path, record=True)
+    return (msg, False)
 
 
 def tool_nodeinfo(args):
@@ -2171,31 +3135,221 @@ def tool_nodeinfo(args):
     return ("\n".join(out), False)
 
 
+CLIENTLUA_BOOTSTRAP = r'''
+local M="srcds_mcp_client_v1"
+local READY="@READY_TOKEN@"
+_G.__SRCDS_MCP_CLIENT_V1=_G.__SRCDS_MCP_CLIENT_V1 or {parts={}}
+local S=_G.__SRCDS_MCP_CLIENT_V1
+net.Receive(M,function(bits)
+  if bits>524288 then return end
+  if net.ReadString()~="payload" then return end
+  local tok=net.ReadString()
+  local idx,total=net.ReadUInt(16),net.ReadUInt(16)
+  local compressed=net.ReadBool()
+  local rawlen=net.ReadUInt(32)
+  local crc=net.ReadString()
+  local n=net.ReadUInt(16)
+  if #tok~=16 or not tok:match("^[a-f0-9]+$") or rawlen>65536 or
+     #crc>10 or not crc:match("^%d+$") or idx<1 or total<1 or total>2 or idx>total or n>48000 then return end
+  local part=net.ReadData(n)
+  if not part or #part~=n then return end
+  local q=S.parts[tok]
+  if not q then
+    q={chunks={},got=0,total=total,compressed=compressed,rawlen=rawlen,crc=crc}
+    S.parts[tok]=q
+    timer.Create("srcds_mcp_client_gc_"..tok,20,1,function() S.parts[tok]=nil end)
+  end
+  if q.total~=total or q.compressed~=compressed or q.rawlen~=rawlen or q.crc~=crc then return end
+  if not q.chunks[idx] then q.chunks[idx]=part q.got=q.got+1 end
+  if q.got<q.total then return end
+  timer.Remove("srcds_mcp_client_gc_"..tok)
+  S.parts[tok]=nil
+  local packed=table.concat(q.chunks)
+  local src=q.compressed and util.Decompress(packed) or packed
+  local status,detail="ok",""
+  if not src or #src~=q.rawlen or util.CRC(src)~=q.crc then
+    status,detail="transfer_error","payload length/checksum mismatch"
+  else
+    local fn=CompileString(src,"mcp_clientlua_"..tok,false)
+    if type(fn)~="function" then
+      status,detail="compile_error",tostring(fn)
+    else
+      local oldhook,oldmask,oldcount=debug.gethook()
+      local function restorehook()
+        if oldhook then debug.sethook(oldhook,oldmask,oldcount) else debug.sethook() end
+      end
+      local ins=0
+      debug.sethook(function()
+        ins=ins+1
+        if ins>200 then restorehook() error("[mcp client] instruction budget exceeded",2) end
+      end,"",100000)
+      local ok,err=xpcall(fn,function(e) return tostring(e).."\n"..debug.traceback("",2) end)
+      restorehook()
+      if not ok then status,detail="runtime_error",tostring(err) end
+    end
+  end
+  detail=tostring(detail or ""):gsub("[\r\n]+"," / "):sub(1,600)
+  net.Start(M)
+  net.WriteString("ack")
+  net.WriteString(tok)
+  net.WriteString(status)
+  net.WriteString(detail)
+  net.SendToServer()
+end)
+local function ready(attempt)
+  local ok=pcall(function()
+    net.Start(M)
+    net.WriteString("ready")
+    net.WriteString(READY)
+    net.SendToServer()
+  end)
+  if not ok and attempt<12 then timer.Simple(0.25,function() ready(attempt+1) end) end
+end
+ready(1)
+'''
+
+if len(CLIENTLUA_BOOTSTRAP.encode("utf-8")) > 5800:
+    raise RuntimeError("clientlua bootstrap exceeds Player:SendLua's 6000-byte limit")
+
+
 CLIENTLUA_BODY = r'''
-local _b64 = "@B64@"
-local _tgt = "@TARGET@"
-local CH = 900
+local _tok = "@TOKEN@"
+local _tgt = @TARGET_LUA@
+local _code = util.Base64Decode("@B64@")
+local _boot = util.Base64Decode("@BOOT_B64@")
+local MSG = "srcds_mcp_client_v1"
+local CHUNK = 48000
+local ACK_TIMEOUT = @ACK_TIMEOUT@
+local MAX_RECIPIENTS = @MAX_RECIPIENTS@
+
+if not isstring(_code) or not isstring(_boot) then error("clientlua payload decode failed", 0) end
+
 local targets = {}
-if _tgt == "all" then
-  targets = player.GetAll()
-else
-  for _, p in ipairs(player.GetAll()) do
-    if p:SteamID() == _tgt or tostring(p:SteamID64()) == _tgt or p:Nick() == _tgt then
+for _, p in ipairs(player.GetAll()) do
+  if IsValid(p) and p:IsPlayer() and not p:IsBot() and p:IsFullyAuthenticated() then
+    if _tgt == "all" or p:SteamID() == _tgt or tostring(p:SteamID64()) == _tgt then
       targets[#targets + 1] = p
     end
   end
 end
-local n = 0
-for _, ply in ipairs(targets) do
-  if IsValid(ply) then
-    ply:SendLua("__mcpcl=''")
-    for i = 1, #_b64, CH do ply:SendLua("__mcpcl=__mcpcl..'" .. _b64:sub(i, i + CH - 1) .. "'") end
-    ply:SendLua("RunString(util.Base64Decode(__mcpcl),'mcp_clientlua') __mcpcl=nil")
-    n = n + 1
+if #targets == 0 then error("zero fully authenticated human clients matched target", 0) end
+if #targets > MAX_RECIPIENTS then
+  error("recipient count " .. #targets .. " exceeds safety cap " .. MAX_RECIPIENTS, 0)
+end
+
+local msg_id = util.AddNetworkString(MSG)
+if not msg_id or msg_id == 0 then error("could not pool clientlua network message", 0) end
+_G.__SRCDS_MCP_CLIENT_SERVER_V1 = _G.__SRCDS_MCP_CLIENT_SERVER_V1 or { pending = {} }
+local STATE = _G.__SRCDS_MCP_CLIENT_SERVER_V1
+
+-- One generic receiver serves concurrent tokenized requests. It never trusts a
+-- token alone: the sender must be one of that request's exact player entities.
+net.Receive(MSG, function(bits, ply)
+  if bits > 32768 then return end
+  local kind = net.ReadString()
+  local tok = net.ReadString()
+  local state = rawget(_G, "__SRCDS_MCP_CLIENT_SERVER_V1")
+  local pending = state and state.pending and state.pending[tok]
+  if not pending or not pending.want[ply] then return end
+  if kind == "ready" then
+    if pending.ready[ply] then return end
+    pending.ready[ply] = true
+    pending.ready_count = pending.ready_count + 1
+    pending.send(ply)
+    return
+  end
+  if kind ~= "ack" or not pending.ready[ply] or pending.seen[ply] then return end
+  local status = net.ReadString()
+  local detail = net.ReadString()
+  if status ~= "ok" and status ~= "compile_error" and status ~= "runtime_error" and status ~= "transfer_error" then
+    status = "invalid_ack"
+  end
+  pending.seen[ply] = true
+  pending.acked = pending.acked + 1
+  pending.counts[status] = (pending.counts[status] or 0) + 1
+  if status ~= "ok" and #pending.errors < 10 then
+    pending.errors[#pending.errors + 1] = "client#" .. pending.want[ply] .. " " .. status .. " " ..
+      tostring(detail or ""):gsub("[\r\n]+", " / "):sub(1, 600)
+  end
+  if pending.acked >= pending.expected then pending.finish() end
+end)
+
+local pending = {
+  want = {}, seen = {}, ready = {}, sent = {}, counts = {}, errors = {},
+  ready_count = 0, acked = 0,
+  expected = #targets, done = false,
+}
+for i, ply in ipairs(targets) do pending.want[ply] = i end
+STATE.pending[_tok] = pending
+
+pending.finish = function()
+  if pending.done then return end
+  pending.done = true
+  timer.Remove("srcds_mcp_client_timeout_" .. _tok)
+  STATE.pending[_tok] = nil
+  local okn = pending.counts.ok or 0
+  local timeoutn = pending.expected - pending.acked
+  local compile_n = pending.counts.compile_error or 0
+  local runtime_n = pending.counts.runtime_error or 0
+  local transfer_n = (pending.counts.transfer_error or 0) + (pending.counts.invalid_ack or 0)
+  LOG("clientlua ack: sent=" .. pending.expected .. " ready=" .. pending.ready_count ..
+      " acked=" .. pending.acked .. " ok=" .. okn ..
+      " compile_error=" .. compile_n .. " runtime_error=" .. runtime_n ..
+      " transfer_error=" .. transfer_n .. " timeout=" .. timeoutn)
+  for _, line in ipairs(pending.errors) do LOG(line) end
+  CHECK(okn == pending.expected,
+        "client execution acknowledgements incomplete/failed: ok=" .. okn .. "/" .. pending.expected)
+  MCP_DONE()
+end
+
+local packed = util.Compress(_code)
+local compressed = isstring(packed) and #packed < #_code
+if not compressed then packed = _code end
+local total = math.ceil(#packed / CHUNK)
+local crc = util.CRC(_code)
+
+pending.send = function(ply)
+  if pending.done or pending.sent[ply] or not IsValid(ply) then return end
+  pending.sent[ply] = true
+  for i = 1, total do
+    local part = packed:sub((i - 1) * CHUNK + 1, i * CHUNK)
+    net.Start(MSG)
+    net.WriteString("payload")
+    net.WriteString(_tok)
+    net.WriteUInt(i, 16)
+    net.WriteUInt(total, 16)
+    net.WriteBool(compressed)
+    net.WriteUInt(#_code, 32)
+    net.WriteString(crc)
+    net.WriteUInt(#part, 16)
+    net.WriteData(part, #part)
+    net.Send(ply)
   end
 end
-LOG("sent clientside code (" .. #_b64 .. " b64 bytes) to " .. n .. " client(s)")
-return n
+
+timer.Create("srcds_mcp_client_timeout_" .. _tok, ACK_TIMEOUT, 1, pending.finish)
+
+-- The fixed net name may have been pooled for the first time above. Give its
+-- string-table update time to reach clients, then let each bootstrap explicitly
+-- announce receiver readiness before pending.send transmits any payload.
+timer.Simple(0.5, function()
+  if pending.done then return end
+  for _, ply in ipairs(targets) do
+    local ok, err = pcall(ply.SendLua, ply, _boot)
+    if not ok and not pending.seen[ply] then
+      pending.seen[ply] = true
+      pending.acked = pending.acked + 1
+      pending.counts.transfer_error = (pending.counts.transfer_error or 0) + 1
+      if #pending.errors < 10 then
+        pending.errors[#pending.errors + 1] = "client#" .. pending.want[ply] ..
+          " transfer_error bootstrap dispatch failed: " .. tostring(err):gsub("[\r\n]+", " / "):sub(1, 500)
+      end
+    end
+  end
+  if pending.acked >= pending.expected then timer.Simple(0, pending.finish) end
+end)
+
+return #targets
 '''
 
 
@@ -2206,6 +3360,18 @@ def tool_clientlua(args):
     code = args.get("code", "")
     if not code.strip():
         return ("code is empty", True)
+    code_bytes = code.encode("utf-8")
+    if len(code_bytes) > CLIENTLUA_MAX_BYTES:
+        return ("clientlua code too large: %d UTF-8 bytes (max %d)" %
+                (len(code_bytes), CLIENTLUA_MAX_BYTES), True)
+    if "target" not in args or not isinstance(args.get("target"), str) or not args["target"].strip():
+        return ("target is required: give an exact SteamID/SteamID64, or explicit target='all'.", True)
+    target = args["target"].strip()
+    if target != "all" and not (re.fullmatch(r"STEAM_[0-5]:[01]:\d+", target, re.I) or
+                                re.fullmatch(r"\d{17}", target)):
+        return ("target must be 'all', an exact SteamID, or a 17-digit SteamID64; nicknames are not accepted.", True)
+    if target.lower().startswith("steam_"):
+        target = target.upper()
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
@@ -2215,21 +3381,82 @@ def tool_clientlua(args):
         players, maxpl, is_live = live_info(srv)
         ln = ("  (%d/%s players%s)" % (players, maxpl, " — LIVE" if is_live else "")) if players is not None else ""
         return ("BLOCKED: runs clientside Lua on %s clients%s. Re-call with confirm=true." % (server, ln), True)
-    target = str(args.get("target", "all")).replace('"', "").replace("'", "")
-    cb64 = base64.b64encode(code.encode("utf-8")).decode()
-    body = CLIENTLUA_BODY.replace("@B64@", cb64).replace("@TARGET@", target)
+    if target == "all" and args.get("broadcast") is not True:
+        return ("REFUSED: target='all' additionally requires broadcast=true to make the fan-out explicit.", True)
+    if target == "all" and args.get("force") is not True:
+        return ("REFUSED: broadcasting executable client Lua additionally requires force=true.", True)
     tok = os.urandom(8).hex()
-    runner = render_runner(tok, "_mcp/%s_body.lua" % tok, False)
+    cb64 = base64.b64encode(code_bytes).decode()
+    bootstrap = CLIENTLUA_BOOTSTRAP.replace("@READY_TOKEN@", tok)
+    boot64 = base64.b64encode(bootstrap.encode("utf-8")).decode()
+    body = (CLIENTLUA_BODY
+            .replace("@TOKEN@", tok)
+            .replace("@TARGET_LUA@", json.dumps(target))
+            .replace("@B64@", cb64)
+            .replace("@BOOT_B64@", boot64)
+            .replace("@ACK_TIMEOUT@", str(CLIENTLUA_ACK_TIMEOUT))
+            .replace("@MAX_RECIPIENTS@", str(CLIENTLUA_MAX_RECIPIENTS)))
+    runner = render_runner(tok, "_mcp/%s_body.lua" % tok, True)
     res = run_driver({"op": "lua", "uuid": srv["uuid"], "token": tok, "body": body,
-                      "runner": runner, "async": False, "capture_timeout": 8}, timeout=55)
-    log_event({"ev": "clientlua", "server": server, "target": target, "bytes": len(code), "ok": res.get("ok")})
+                      "runner": runner, "async": True,
+                      "async_timeout": CLIENTLUA_ACK_TIMEOUT + 3}, timeout=60)
+    log_event({"ev": "clientlua", "server": server, "target": target,
+               "bytes": len(code_bytes), "broadcast": target == "all", "ok": res.get("ok")})
     if not res.get("ok"):
         return ("clientlua failed: %s" % res.get("error"), True)
     r = res.get("result") or {}
+    note = r.get("note") or res.get("note") or ""
+    if not r.get("started"):
+        return ("clientlua failed before the server runner started%s" %
+                ((": " + note) if note else ""), True)
+    if not r.get("ended"):
+        return ("clientlua acknowledgement window did not complete%s" %
+                ((": " + note) if note else ""), True)
     if r.get("err"):
         return ("clientlua error: " + r["err"], True)
-    out = r.get("out", "") or ("sent to %s client(s)" % (r.get("ret") if r.get("ret") is not None else "?"))
-    return ("[%s] clientlua → target=%s\n%s" % (server.upper(), target, out), False)
+    try:
+        sent = int(r.get("ret"))
+    except (TypeError, ValueError):
+        return ("clientlua failed: server did not return a recipient count", True)
+    if sent <= 0:
+        return ("clientlua failed: zero eligible clients were targeted", True)
+    summ = r.get("sum") or ""
+    sm = re.fullmatch(r"p=(\d+) f=(\d+)", summ.strip())
+    if not sm or (int(sm.group(1)) + int(sm.group(2))) != 1:
+        return ("clientlua failed: missing or malformed execution acknowledgement summary", True)
+    nfail = int(sm.group(2))
+    ack = re.search(
+        r"clientlua ack: sent=(\d+) ready=(\d+) acked=(\d+) ok=(\d+) compile_error=(\d+) "
+        r"runtime_error=(\d+) transfer_error=(\d+) timeout=(\d+)",
+        r.get("out") or "",
+    )
+    if not ack:
+        return ("clientlua failed: acknowledgement counters were not returned", True)
+    sent_reported, ready_n, acked, okn, compile_n, runtime_n, transfer_n, timeout_n = (
+        int(v) for v in ack.groups()
+    )
+    counters_valid = (
+        sent_reported == sent
+        and 0 <= ready_n <= sent
+        and 0 <= acked <= sent
+        and okn + compile_n + runtime_n <= ready_n
+        and okn + compile_n + runtime_n + transfer_n == acked
+        and timeout_n == sent - acked
+        and ((nfail == 0) == (okn == sent and ready_n == sent))
+    )
+    if not counters_valid:
+        return ("clientlua failed: inconsistent execution acknowledgement counters", True)
+    lines = ["[%s] clientlua synchronous execution ACK → target=%s, recipients=%d" %
+             (server.upper(), "all" if target == "all" else "specific", sent)]
+    if r.get("out"):
+        lines.append(r["out"])
+    for failure in (r.get("fails") or [])[:10]:
+        lines.append("[FAIL] " + failure)
+    if nfail:
+        lines.append("Client-reported synchronous execution failed or timed out; no visual/player acceptance is implied.")
+    else:
+        lines.append("All targeted clients acknowledged synchronous execution; visual/player acceptance remains separate.")
+    return ("\n".join(lines), nfail > 0)
 
 
 def tool_power(args):
@@ -2274,9 +3501,13 @@ def tool_power(args):
     if args.get("confirm") is not True:
         ln = ("  Currently %d/%s players%s." % (players, maxpl, " — LIVE!" if is_live else "")) if players is not None else ""
         return ("BLOCKED: power %s on %s.%s Re-call with confirm=true." % (action.upper(), server, ln), True)
-    if action in ("stop", "restart", "kill") and is_live and args.get("force") is not True:
-        return ("REFUSED: %s is LIVE (%d players) — %s would disrupt them. Re-call with force=true to override."
-                % (server.upper(), players or 0, action), True)
+    if action in ("stop", "restart", "kill") and args.get("force") is not True:
+        if players is None:
+            return ("REFUSED: %s player population is UNKNOWN (A2S unavailable) — %s could disrupt connected "
+                    "players. Re-call with force=true to override." % (server.upper(), action), True)
+        if players > 0:
+            return ("REFUSED: %s has %d connected player(s) — %s would disrupt them. Re-call with "
+                    "force=true to override." % (server.upper(), players, action), True)
     res = run_driver({"op": "power", "uuid": srv["uuid"], "action": action}, timeout=100)
     log_event({"ev": "power", "server": server, "action": action, "confirm": True,
                "force": bool(args.get("force")), "via": res.get("via"), "ok": res.get("ok")})
@@ -2299,13 +3530,112 @@ def tool_power(args):
             % (server.upper(), action.upper(), via, res.get("out", ""), note, tail), False)
 
 
+def tool_monitor(args):
+    server = args.get("server")
+    if server not in SERVER_NAMES:
+        return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
+    srv = resolve(server)
+    if not srv:
+        return ("could not resolve server '%s' (host unreachable?)" % server, True)
+    action = args.get("action")
+    if not action:
+        # ergonomic inference: pattern/watch given -> arm; id given -> check; else list
+        action = "arm" if (args.get("pattern") or args.get("watch")) else ("check" if args.get("id") else "list")
+    if action == "arm":
+        watch = args.get("watch") or ("pattern" if args.get("pattern") else None)
+        if watch not in ("pattern", "down", "up"):
+            return ("watch must be 'pattern' (console regex), 'down' or 'up' (state transition).", True)
+        pattern = (args.get("pattern") or "").strip()
+        if watch == "pattern":
+            if not pattern:
+                return ("give 'pattern' (python regex, e.g. '(?i)lua error').", True)
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                return ("bad regex: %s" % e, True)
+            if not srv.get("running"):
+                return ("%s is DOWN — no console to follow. Use watch:'up' to be told when it boots." % server.upper(), True)
+        timeout_min = max(1, min(int(args.get("timeout_min", 30)), 240))
+        mid = os.urandom(4).hex()
+        res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "arm", "id": mid,
+                          "mode": watch, "pattern": pattern, "timeout_s": timeout_min * 60}, timeout=30)
+        log_event({"ev": "monitor_arm", "server": server, "watch": watch,
+                   "pattern": pattern[:120], "id": mid, "ok": res.get("ok")})
+        if not res.get("ok"):
+            return ("arm failed: %s" % res.get("error"), True)
+        if not res.get("statefile"):
+            return ("arm failed: watcher process did not come up (python3/docker missing on host?)", True)
+        what = ("console regex /%s/" % pattern) if watch == "pattern" else ("server going %s" % watch.upper())
+        return ("[%s] monitor ARMED — id=%s, watching %s for %d min.\n"
+                "Poll: srcds_monitor {server:'%s', id:'%s', wait:50} — returns early on a hit. "
+                "Disarm: action:'stop'." % (server.upper(), mid, what, timeout_min, server, mid), False)
+    if action == "list":
+        res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "list"}, timeout=30)
+        log_event({"ev": "monitor_list", "server": server, "ok": res.get("ok")})
+        if not res.get("ok"):
+            return ("list failed: %s" % res.get("error"), True)
+        mons = res.get("monitors") or []
+        if not mons:
+            return ("[%s] no monitors (arm one with watch:'pattern'+pattern, or watch:'down'/'up')." % server.upper(), False)
+        out = ["[%s] monitors:" % server.upper()]
+        for m in mons:
+            out.append("  %s  %-9s %-8s matches=%-3s age=%dm  %s" % (
+                m.get("id"), m.get("phase"), m.get("mode"), m.get("matches"),
+                int((m.get("age_s") or 0) / 60), m.get("pattern") or ""))
+        return ("\n".join(out), False)
+    mid = (args.get("id") or "").strip()
+    if action == "stop":
+        res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "stop", "id": mid}, timeout=30)
+        log_event({"ev": "monitor_stop", "server": server, "id": mid, "ok": res.get("ok")})
+        if not res.get("ok"):
+            return ("stop failed: %s" % res.get("error"), True)
+        d = res.get("watch") or {}
+        return ("[%s] monitor %s stopped (%s, %d matches recorded)." % (
+            server.upper(), mid, d.get("phase"), d.get("match_count", 0)), False)
+    if action != "check":
+        return ("action must be one of: arm, check, stop, list", True)
+    wait = max(0, min(int(args.get("wait", 0)), 55))
+    res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "check", "id": mid,
+                      "wait": wait, "after": int(args.get("after", 0))}, timeout=wait + 30)
+    log_event({"ev": "monitor_check", "server": server, "id": mid, "wait": wait, "ok": res.get("ok")})
+    if not res.get("ok"):
+        return ("check failed: %s" % res.get("error"), True)
+    d = res.get("watch") or {}
+    ph = (d.get("phase") or "?").upper()
+    mode = d.get("mode")
+    lines = ["[%s] monitor %s — %s (%s, %.1f min in)" % (server.upper(), mid, ph, mode,
+                                                         (d.get("elapsed") or 0) / 60.0)]
+    if mode == "pattern":
+        mc = d.get("match_count", 0)
+        matches = d.get("matches") or []
+        if mc:
+            lines[0] += "  matches=%d" % mc
+            if mc > 15:
+                lines.append("  (showing last 15 of %d — pass after:%d to await the next)" % (mc, mc))
+            for t, l in matches[-15:]:
+                lines.append("  [+%ss] %s" % (t, l))
+    else:
+        hist = d.get("history") or []
+        if hist:
+            lines.append("  state: " + " -> ".join("%s@+%ss" % (s, t) for t, s in hist[-8:]))
+        ctx = d.get("context") or []
+        if ctx:
+            lines.append("--- last %d console lines at the event ---" % len(ctx))
+            lines += ["  " + l for l in ctx[-25:]]
+    if d.get("note"):
+        lines.append("  (note: %s)" % d["note"])
+    if d.get("phase") == "watching":
+        lines.append("  still watching — re-check with wait:50, or action:'stop' to disarm.")
+    return ("\n".join(lines), False)
+
+
 # ----------------------------------------------------------------------------
 # Database (MariaDB) tools — query via `docker exec` into the mariadb container,
 # root password read from the container env ($MYSQL_ROOT_PASSWORD), never extracted.
 # ----------------------------------------------------------------------------
 # Convenience aliases: a game name -> its main schema. Any real schema name also works.
 DB_ALIAS = CFG.get("db_aliases") or {}
-DB_READ_FIRST = {"select", "show", "describe", "desc", "explain", "with", "use", "help", "checksum"}
+DB_READ_FIRST = {"select", "show", "describe", "desc", "explain", "use", "help", "checksum"}
 
 
 def _resolve_db(database):
@@ -2329,7 +3659,9 @@ def _strip_sql(sql):
 
 
 def classify_db(sql):
-    """None if every statement is read-only (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH/USE); else a reason."""
+    """None only for statements permitted inside the read-only transaction path."""
+    if re.search(r"(?is)/\*\s*(?:!|M!)", sql):
+        return "MariaDB/MySQL executable comment"
     s = _strip_sql(sql)
     # a SELECT ... INTO OUTFILE/DUMPFILE writes a file despite the read-looking leading keyword
     if re.search(r"(?i)\binto\s+(outfile|dumpfile)\b", s):
@@ -2356,7 +3688,8 @@ def tool_db_query(args):
                 "player/server data. Re-call with confirm=true to run it. Nothing was executed."
                 % (reason, database or "?"), True)
     res = run_driver({"op": "db", "sql": sql, "database": database,
-                      "format": args.get("format", "tsv")}, timeout=60)
+                      "format": args.get("format", "tsv"),
+                      "read_only": reason is None}, timeout=60)
     log_event({"ev": "db_query", "database": database, "write": bool(reason),
                "confirm": bool(args.get("confirm")), "sql": sql[:200], "ok": res.get("ok")})
     if not res.get("ok"):
@@ -2385,7 +3718,8 @@ def tool_db_schema(args):
         if not _db_name_ok(table):
             return ("invalid table name", True)
         sql = "DESCRIBE `%s`.`%s`; SHOW INDEX FROM `%s`.`%s`;" % (database, table, database, table)
-    res = run_driver({"op": "db", "sql": sql, "format": fmt}, timeout=30)
+    res = run_driver({"op": "db", "sql": sql, "format": fmt,
+                      "read_only": True}, timeout=30)
     log_event({"ev": "db_schema", "database": database, "table": table, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("db schema failed: %s" % (res.get("error_out") or res.get("error")), True)
@@ -2394,21 +3728,242 @@ def tool_db_schema(args):
 
 
 # ----------------------------------------------------------------------------
+# Database (MongoDB) tools — mongosh via `docker exec` into the mongo container;
+# root credentials are read from the container env ($MONGO_INITDB_ROOT_USERNAME /
+# $MONGO_INITDB_ROOT_PASSWORD) inside the container and never leave it.
+# ----------------------------------------------------------------------------
+MONGO_CFG = CFG.get("mongo") or {}
+MONGO_ALIAS = CFG.get("mongo_aliases") or {}
+
+# Explicitly-mutating methods: named so the block message can say WHAT it caught.
+MONGO_WRITE_METHODS = {
+    "insert", "insertone", "insertmany", "update", "updateone", "updatemany",
+    "replaceone", "delete", "deleteone", "deletemany", "remove", "save",
+    "findandmodify", "findoneandupdate", "findoneanddelete", "findoneandreplace",
+    "bulkwrite", "drop", "dropdatabase", "dropindex", "dropindexes",
+    "createindex", "createindexes", "createcollection", "createview",
+    "renamecollection", "converttocapped", "compact", "reindex", "validate",
+    "mapreduce", "runcommand", "admincommand", "eval",
+    "createuser", "dropuser", "updateuser", "changeuserpassword",
+    "grantrolestouser", "revokerolesfromuser", "createrole", "droprole",
+    "shutdownserver", "killop", "setparameter", "fsynclock", "fsyncunlock",
+    "setprofilinglevel", "cleanuporphaned", "watch",
+}
+
+# Everything a read-only query legitimately needs: collection/db read methods plus
+# the JS/cursor helpers that show up in real queries. Anything NOT here is treated
+# as a write (fail closed) and needs confirm=true.
+MONGO_READ_METHODS = {
+    # collection / db reads
+    "find", "findone", "aggregate", "count", "countdocuments",
+    "estimateddocumentcount", "distinct", "getindexes", "getindexkeys",
+    "stats", "datasize", "storagesize", "totalsize", "totalindexsize",
+    "getcollectionnames", "getcollectioninfos", "getcollection", "getsiblingdb",
+    "getdb", "getname", "getmongo", "exists", "iscapped", "explain", "itcount",
+    "listcollections", "listcommands", "version", "hello", "serverstatus",
+    "hostinfo", "buildinfo", "getprofilinglevel", "currentop",
+    # cursor shaping
+    "limit", "skip", "sort", "project", "hint", "batchsize", "maxtimems",
+    "collation", "toarray", "hasnext", "next", "pretty", "objsleftinbatch",
+    "readpref", "allowdiskuse", "tojson", "toobject",
+    # JS / formatting helpers
+    "map", "filter", "reduce", "foreach", "some", "every", "flat", "flatmap",
+    "slice", "splice", "concat", "join", "split", "push", "pop", "shift",
+    "unshift", "reverse", "sortdoc", "keys", "values", "entries", "fromentries",
+    "assign", "stringify", "parse", "print", "printjson", "tostring",
+    "tofixed", "toprecision", "tolocalestring", "toisostring", "tolowercase",
+    "touppercase", "trim", "trimstart", "trimend", "padstart", "padend",
+    "repeat", "includes", "indexof", "lastindexof", "startswith", "endswith",
+    "replace", "replaceall", "match", "matchall", "test", "exec", "search",
+    "isarray", "isnan", "isinteger", "from", "of", "round", "floor", "ceil",
+    "abs", "min", "max", "pow", "sqrt", "random", "gettime", "getfullyear",
+    "getmonth", "getdate", "gethours", "getminutes", "getseconds", "now",
+    "localecompare", "charat", "charcodeat", "substring", "substr", "sort",
+    "number", "string", "boolean", "date", "objectid", "isodate", "long",
+    "call", "apply", "bind", "hasownproperty", "getownpropertynames",
+    "defineproperty", "add", "has", "get", "set",   # Map/Set helpers
+}
+
+_MONGO_METHOD_RE = re.compile(r"\.\s*([A-Za-z_$][\w$]*)\s*\(")
+
+
+def _strip_js(js):
+    s = re.sub(r"/\*.*?\*/", " ", js, flags=re.S)         # /* */ comments
+    s = re.sub(r"//[^\n]*", " ", s)                        # // comments
+    s = re.sub(r"'(?:\\.|[^'\\])*'", "''", s)              # '...'
+    s = re.sub(r'"(?:\\.|[^"\\])*"', '""', s)              # "..."
+    s = re.sub(r"`(?:\\.|[^`\\])*`", "``", s)              # `...`
+    return s
+
+
+def classify_mongo(js):
+    """None if the script only calls read-only methods; else a human reason."""
+    # $out / $merge write a collection from inside an otherwise read-looking
+    # aggregate. Match them only in KEY position ({$out: ..} / {"$merge": ..}) and
+    # on the raw text, so a quoted stage name still trips it but the same token
+    # appearing in a filter VALUE (e.g. {subject:"a $out b"}) does not.
+    if re.search(r"""["']?\$(out|merge)["']?\s*:""", js):
+        return "aggregate stage $out/$merge (writes a collection)"
+    s = _strip_js(js)
+    for name in _MONGO_METHOD_RE.findall(s):
+        low = name.lower()
+        if low in MONGO_WRITE_METHODS:
+            return "write/admin method .%s()" % name
+        if low not in MONGO_READ_METHODS:
+            return "method .%s() is not on the read-only allowlist" % name
+    return None
+
+
+def _resolve_mongo_db(database):
+    if not database:
+        return None
+    d = database.strip()
+    return MONGO_ALIAS.get(d.lower(), d)
+
+
+def _mongo_db_ok(d):
+    return bool(d) and all(c.isalnum() or c in "_-" for c in d)
+
+
+def _run_mongo(script, database=None, fmt="shell", timeout=75):
+    return run_driver({"op": "mongo", "script": script, "database": database,
+                       "format": fmt, "container": MONGO_CFG.get("container") or "",
+                       "auth_db": MONGO_CFG.get("auth_db") or "admin"}, timeout=timeout)
+
+
+def _mongo_body(res):
+    """Whatever mongosh actually said (stdout + stderr), or "" if it said nothing."""
+    out = res.get("output", "") or ""
+    if res.get("error_out"):
+        out += ("\n" if out else "") + "[mongosh] " + res["error_out"]
+    if res.get("truncated"):
+        out += "\n... (output truncated — add .limit()/a projection, or narrow the query)"
+    return out
+
+
+def _mongo_out(res):
+    return _mongo_body(res) or "(no output — mongosh prints the last expression's value; use print() if you see nothing)"
+
+
+def _mongo_err(res):
+    """Failure text: mongosh's own message if it produced one, else the driver's
+    (e.g. 'mongo container not found' on a node with no mongo deployed)."""
+    return _mongo_body(res) or res.get("error") or "unknown error"
+
+
+def tool_mongo_query(args):
+    database = _resolve_mongo_db(args.get("database"))
+    if database and not _mongo_db_ok(database):
+        return ("invalid database name (letters/digits/underscore/hyphen only)", True)
+    script = args.get("script", "")
+    if not script.strip():
+        return ("script is empty", True)
+    reason = classify_mongo(script)
+    gate_reason = reason or "arbitrary mongosh JavaScript cannot be statically proven read-only"
+    if args.get("confirm") is not True:
+        log_event({"ev": "mongo_blocked", "database": database,
+                   "reason": gate_reason, "script": script})
+        return ("BLOCKED: %s against the LIVE game Mongo DB '%s'. Arbitrary mongosh scripts require "
+                "confirm=true; use srcds_mongo_schema for unconfirmed structured inspection. Nothing was executed."
+                % (gate_reason, database or "?"), True)
+    res = _run_mongo(script, database, args.get("format", "shell"))
+    log_event({"ev": "mongo_query", "database": database, "write": bool(reason),
+               "confirm": bool(args.get("confirm")), "script": script[:200], "ok": res.get("ok")})
+    if not res.get("ok"):
+        return ("mongo query failed: %s" % _mongo_err(res), True)
+    return ("[mongo:%s]\n%s" % (database or "(no db selected)", _mongo_out(res)), False)
+
+
+_MONGO_LIST_DBS = (
+    "var d=db.adminCommand({listDatabases:1}).databases||[];"
+    "print('database\\tsize_mb\\tempty');"
+    "print(d.map(function(x){return x.name+'\\t'+Math.round((Number(x.sizeOnDisk)||0)/104857.6)/10+'\\t'+(x.empty?'yes':'')}).join('\\n'))"
+)
+
+_MONGO_LIST_COLLS = (
+    "var rows=db.getCollectionNames().sort().map(function(c){"
+    "var s={};try{s=db.runCommand({collStats:c})}catch(e){}"
+    "return [c,db.getCollection(c).countDocuments(),Math.round((s.size||0)/1024),Math.round((s.totalIndexSize||0)/1024)].join('\\t')});"
+    "print('collection\\tdocs\\tdata_kb\\tidx_kb');print(rows.join('\\n'))"
+)
+
+
+def _mongo_describe_js(coll, sample):
+    return (
+        "var C=%s,N=%d;var col=db.getCollection(C),docs=col.find().limit(N).toArray();"
+        "function ty(v){if(v===null)return'null';if(v===undefined)return'undefined';"
+        "if(Array.isArray(v))return'array';if(v instanceof Date)return'date';"
+        "var c=v&&v.constructor&&v.constructor.name;"
+        "if(c&&['ObjectId','Long','Int32','Double','Decimal128','Binary','Timestamp','UUID','Code','MinKey','MaxKey'].indexOf(c)>=0)return c;"
+        "if(typeof v==='object')return'object';return typeof v}"
+        "var f={};docs.forEach(function(d){Object.keys(d).forEach(function(k){"
+        "f[k]=f[k]||{n:0,t:{}};f[k].n++;var t=ty(d[k]);f[k].t[t]=(f[k].t[t]||0)+1})});"
+        "print('-- fields (inferred from '+docs.length+' sampled docs of '+col.countDocuments()+') --');"
+        "print('field\\ttypes\\tpresent');"
+        "print(Object.keys(f).map(function(k){return k+'\\t'+Object.keys(f[k].t).map(function(t){return t+':'+f[k].t[t]}).join(',')+'\\t'+f[k].n+'/'+docs.length}).join('\\n'));"
+        "print('-- indexes --');"
+        "print(col.getIndexes().map(function(i){return i.name+'\\t'+EJSON.stringify(i.key)+(i.unique?'\\tUNIQUE':'')}).join('\\n'));"
+        "print('-- sample doc --');"
+        "print(docs.length?EJSON.stringify(docs[0],null,1):'(empty collection)')"
+        % (json.dumps(coll), sample)
+    )
+
+
+def tool_mongo_schema(args):
+    database = _resolve_mongo_db(args.get("database"))
+    coll = (args.get("collection") or "").strip()
+    if database and not _mongo_db_ok(database):
+        return ("invalid database name", True)
+    if not database:
+        script, what = _MONGO_LIST_DBS, "databases"
+    elif not coll:
+        script, what = _MONGO_LIST_COLLS, "collections in %s" % database
+    else:
+        sample = max(1, min(int(args.get("sample", 25)), 200))
+        script, what = _mongo_describe_js(coll, sample), "%s.%s" % (database, coll)
+    res = _run_mongo(script, database, "shell", timeout=60)
+    log_event({"ev": "mongo_schema", "database": database, "collection": coll, "ok": res.get("ok")})
+    if not res.get("ok"):
+        return ("mongo schema failed: %s" % _mongo_err(res), True)
+    return ("[mongo schema: %s]\n%s" % (what, _mongo_out(res)), False)
+
+
+# ----------------------------------------------------------------------------
 # Tool registry / JSON schemas
 # ----------------------------------------------------------------------------
 SERVER_ENUM = {"type": "string", "enum": list(SERVER_NAMES),
                "description": "Which server. One of: %s." % ", ".join(SERVER_NAMES)}
+
+MCP_INSTRUCTIONS = (
+    "Deploy protocol v2: every file needs expected_sha256 of the original remote bytes used as its edit base "
+    "(full SHA-256 from fetch/download/diff sha256_a), or literal 'missing' for creation. Keep that base hash "
+    "with the working copy. A fresh hash is NOT permission to upload an older working copy: reconcile the "
+    "current remote changes into the candidate first. A stale hash rejects the entire batch. Restore also "
+    "needs expected_sha256 and explicit backup_id from fetch what='history' or 'backups'. Versioned backups "
+    "are mandatory. After a timeout or uncertain result, inspect history and hashes before retrying. "
+    "Batch file operations: whenever more than one file must be compared, call srcds_diff once with "
+    "files=[...]; never loop single-file diffs. For local comparisons each item is {path,local}; for "
+    "server comparisons set server_b and use {path,path_b?}. Likewise, deploy more than one file in "
+    "one srcds_deploy files=[...] call. For trees, use srcds_fetch what='hash' first, then batch-diff "
+    "only the mismatches. Grep multiple regexes/globs/roots in one srcds_grep call using patterns/globs/paths. "
+    "Arbitrary server Lua and mongosh scripts always require confirm=true. srcds_clientlua requires an explicit "
+    "immutable target; target='all' additionally requires broadcast=true and force=true. A clientlua ACK proves "
+    "client-reported synchronous execution only, never later timer/callback behavior or visual/player acceptance."
+)
 
 # Descriptions are built from the configured topology so they stay truthful for
 # any deployment (and after servers are added) — never hardcode server names here.
 _NAMES_TXT = ", ".join(SERVER_NAMES) or "(none configured — set servers[] in config.json)"
 _ALIAS_TXT = ("" if not DB_ALIAS else
               " Configured aliases: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(DB_ALIAS.items())) + ".")
+_MONGO_ALIAS_TXT = ("" if not MONGO_ALIAS else
+                    " Configured aliases: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(MONGO_ALIAS.items())) + ".")
+_MONGO_NOTE_TXT = (" " + MONGO_CFG["note"].strip()) if (MONGO_CFG.get("note") or "").strip() else ""
 
 TOOLS = [
     {
         "name": "srcds_status",
-        "description": "List the configured game servers (%s): up/down, live player count (via A2S), LIVE flag vs per-server thresholds, port, and whether console output capture (-condebug) is available. Read-only, always allowed." % _NAMES_TXT,
+        "description": "List the configured game servers (%s): up/down, live player count (via A2S), LIVE flag vs per-server thresholds, port, and whether console output capture (-condebug) is available. Hostnames and container identifiers are intentionally omitted. Read-only, always allowed." % _NAMES_TXT,
         "inputSchema": {
             "type": "object",
             "properties": {"server": {"type": "string", "enum": list(SERVER_NAMES),
@@ -2417,7 +3972,7 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only volume/console access, always allowed. what='console': tail console.log (-condebug servers only). what='docker': tail the container's docker log — console history WITHOUT -condebug, works even while the server is DOWN (crash forensics; covers the current container lifetime). what='file': read a file; add save_to=<local path> for a binary-safe download (crash dumps, .db). what='dir': list a directory (sizes+mtimes). what='hash': sha1 every file under a path — compare two servers' listings to spot divergence, then srcds_diff the files that differ. what='backups': list deploy backups (restore via srcds_deploy restore:true).",
+        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': read a file; what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2430,13 +3985,14 @@ TOOLS = [
                 "maxbytes": {"type": "integer", "default": 48000, "description": "Byte cap on returned content (keeps the most-recent slice). ANSI color codes are always stripped."},
                 "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
                 "overwrite": {"type": "boolean", "default": False, "description": "Allow save_to to replace an existing local file."},
+                "confirm": {"type": "boolean", "default": False, "description": "Required when save_to is used because that writes to the local filesystem."},
             },
             "required": ["server"],
         },
     },
     {
         "name": "srcds_console",
-        "description": "Inject a server console command via the pty/docker-attach path (works on -norcon servers). The reply is captured on EVERY server: from the console.log delta where -condebug is on, otherwise live off the attached pty (ANSI-stripped and byte-capped either way). Destructive commands (kick/ban/changelevel/map/password/restart/...) require confirm=true.",
+        "description": "Inject one server console command via the pty/docker-attach path. A small explicit read-only allowlist (status/stats/version/uptime, cvarlist/find/help/maps, meta list/version) runs automatically; every other or multi-command input requires confirm=true. Output is ANSI-stripped and byte-capped.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2444,7 +4000,7 @@ TOOLS = [
                 "command": {"type": "string", "description": "The console command, e.g. 'status' or 'ulx adduser ...'."},
                 "grep": {"type": "string", "description": "Optional substring filter on captured output."},
                 "maxbytes": {"type": "integer", "default": 24000, "description": "Byte cap on the returned console.log delta (keeps the most-recent slice)."},
-                "confirm": {"type": "boolean", "default": False, "description": "Set true to authorize a destructive command."},
+                "confirm": {"type": "boolean", "default": False, "description": "Required for every command not on the explicit read-only allowlist."},
             },
             "required": ["server", "command"],
         },
@@ -2460,14 +4016,14 @@ TOOLS = [
             "booleans/tables) is captured and safely serialized (entities/vectors tagged; cycles & "
             "functions won't crash). Globals you set do NOT pollute _G; a runaway loop is auto-aborted. "
             "Output is captured on ALL servers via a volume file (works without -condebug). For timer/coroutine suites set "
-            "async=true and call MCP_DONE() when finished. Mutating/obfuscated Lua (Set*/Kill/Remove/Kick/"
-            "Give/file.Write/RunConsoleCommand/_G[]/loadstring/...) requires confirm=true."),
+            "async=true and call MCP_DONE() when finished. Arbitrary server Lua cannot be proven read-only and "
+            "therefore ALWAYS requires confirm=true."),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Server Lua / verification suite. e.g. 'return player.GetCount()' or a multi-line CHECK/EQ assertion suite. Use `return <expr>` or LOG(...) to get values back."},
-                "confirm": {"type": "boolean", "default": False, "description": "Set true to authorize mutating or obfuscated Lua."},
+                "confirm": {"type": "boolean", "default": False, "description": "Required for every srcds_lua call."},
                 "async": {"type": "boolean", "default": False, "description": "True for suites using timers/coroutines/http; then call MCP_DONE() from the final callback."},
                 "async_timeout": {"type": "integer", "default": 20, "description": "Seconds to wait for MCP_DONE() when async=true (max ~30)."},
             },
@@ -2476,7 +4032,7 @@ TOOLS = [
     },
     {
         "name": "srcds_deploy",
-        "description": "Write files to a server's volume (deploy addon .lua, cfg, etc.). SINGLE: 'to' + ('local' file path OR 'content' inline string). BATCH: 'files' = [{to, local|content}, ...] pushes many files in ONE call — one confirm, one SSH round-trip, per-file result report (use it whenever deploying >1 file). Paths relative to garrysmod/ (no '..'/absolute). UTF-8/CJK-safe (driver write, not scp). Overwritten files are backed up to an out-of-tree backups root by default (never drops backup files into source/addon/git trees). restore:true ROLLS BACK to the last deploy backup — single 'to' or every files[].to (list backups via srcds_fetch what='backups'). .lua files hot-reload via autorefresh. Works even if the server is DOWN (loads on boot). Requires confirm=true.",
+        "description": "Write files to a server's realpath-confined volume. SINGLE: to + local|content. BATCH: files=[{to,local|content}, ...] pushes many files in ONE call (use whenever deploying >1). Per-file cap 64MB; aggregate batch cap 256MB. Overwrites receive out-of-tree rollback backups by default. restore:true rolls back. Requires confirm=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2497,33 +4053,48 @@ TOOLS = [
     },
     {
         "name": "srcds_grep",
-        "description": "Recursively grep a server's live volume source (the ACTUALLY-deployed code, which can diverge from your local copy). Read-only, always allowed.",
+        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Singular fields remain compatible. Read-only, always allowed.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "pattern": {"type": "string", "description": "grep -e pattern (basic regex)."},
+                "patterns": {"type": "array", "minItems": 1, "maxItems": 20,
+                             "items": {"type": "string"}, "description": "Multiple grep -e basic regexes; matches ANY pattern."},
                 "path": {"type": "string", "description": "Subdir under garrysmod/ to search (default whole volume), e.g. 'addons/rals'."},
+                "paths": {"type": "array", "minItems": 1, "maxItems": 25,
+                          "items": {"type": "string"}, "description": "Search several garrysmod-relative roots in the same call."},
                 "glob": {"type": "string", "default": "*.lua", "description": "Filename include glob (default *.lua)."},
+                "globs": {"type": "array", "minItems": 1, "maxItems": 50,
+                          "items": {"type": "string"}, "description": "Multiple filename include globs (OR)."},
+                "exclude_globs": {"type": "array", "maxItems": 50,
+                                  "items": {"type": "string"}, "description": "Filename globs to exclude."},
                 "max": {"type": "integer", "default": 200, "description": "Max matches to return."},
             },
-            "required": ["server", "pattern"],
+            "required": ["server"],
+            "anyOf": [{"required": ["pattern"]}, {"required": ["patterns"]}],
         },
     },
     {
         "name": "srcds_diff",
-        "description": "Unified diff of a DEPLOYED file: compare the same (or another) path across two servers, or a deployed file against a LOCAL file — the fast way to check local<->live and server<->server divergence before deploying. Reports IDENTICAL / DIFFER (+diff, 40KB cap) / binary mismatch with sizes+sha1. For whole trees: compare srcds_fetch what='hash' listings first, then diff the files whose hashes differ. Read-only, always allowed.",
+        "description": "Unified diff of deployed files against LOCAL files or another server. SINGLE: path + exactly one of local/server_b. BATCH: files=[...] compares many files in ONE call/SSH round-trip; never loop single diffs. Per-side cap 16MB and aggregate batch input cap 64MB. Server-to-server is read-only. Local comparisons transmit local contents to the remote comparison driver and require confirm=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "path": {"type": "string", "description": "Side A: path relative to garrysmod/ on `server`."},
-                "server_b": {"type": "string", "enum": list(SERVER_NAMES), "description": "Side B server (same path unless path_b). Give this OR local."},
-                "path_b": {"type": "string", "description": "Optional different path on server_b."},
-                "local": {"type": "string", "description": "Side B = this LOCAL file path. Give this OR server_b."},
-                "context": {"type": "integer", "default": 3, "description": "Diff context lines."},
+                "path": {"type": "string", "description": "SINGLE mode side A: path relative to garrysmod/ on `server`."},
+                "server_b": {"type": "string", "enum": list(SERVER_NAMES), "description": "Side B server for SINGLE or BATCH server-to-server mode. Same path unless path_b."},
+                "path_b": {"type": "string", "description": "SINGLE mode: optional different path on server_b."},
+                "local": {"type": "string", "description": "SINGLE mode side B: this LOCAL file path. Give this OR server_b."},
+                "files": {"type": "array", "minItems": 1, "maxItems": 200, "description": "BATCH mode (use whenever comparing >1 file; max 200). Local mode: [{path,local}, ...]. Server mode: set top-level server_b and use [{path,path_b?}, ...]. Mutually exclusive with top-level path/path_b/local.",
+                          "items": {"type": "object",
+                                    "properties": {"path": {"type": "string"}, "path_b": {"type": "string"}, "local": {"type": "string"}},
+                                    "required": ["path"]}},
+                "context": {"type": "integer", "default": 3, "description": "Diff context lines for every comparison (0-100)."},
+                "maxbytes": {"type": "integer", "default": 48000, "description": "BATCH mode aggregate unified-diff output budget in bytes (max 200000); every file is still accounted for in the status summary."},
+                "confirm": {"type": "boolean", "default": False, "description": "Required for local-file comparisons because local contents cross the SSH boundary; not needed server-to-server."},
             },
-            "required": ["server", "path"],
+            "required": ["server"],
         },
     },
     {
@@ -2539,21 +4110,23 @@ TOOLS = [
     },
     {
         "name": "srcds_clientlua",
-        "description": "Run CLIENTSIDE Lua on connected players (srcds_lua is serverside only). Pushed via chunked base64 SendLua + RunString — good for UI/PAC3/clientside hot-reload without a reconnect. target='all' or a SteamID/SteamID64/nick. Fire-and-forget (returns how many clients it sent to; no per-client result). Best off-peak / few clients. Requires confirm=true.",
+        "description": "Run up to 64KiB of CLIENTSIDE Lua on explicitly targeted, fully Steam-authenticated human clients. A short SendLua bootstrap installs a fixed receiver and returns a ready signal; only then do tokenized compressed net chunks carry the code. Every client reports transfer/compile/synchronous-runtime status. target is REQUIRED and accepts only SteamID/SteamID64 or 'all' (no nickname matching). target='all' additionally requires broadcast=true and force=true. confirm=true is always required. ACK covers the synchronous top-level chunk only; later timer/callback behavior and visual/player acceptance remain separate.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Clientside Lua to run on the target players."},
-                "target": {"type": "string", "default": "all", "description": "'all', or a SteamID / SteamID64 / exact nick."},
+                "target": {"type": "string", "description": "Required: 'all', exact SteamID, or exact 17-digit SteamID64. Nicknames are intentionally rejected."},
+                "broadcast": {"type": "boolean", "default": False, "description": "Required true when target='all'."},
+                "force": {"type": "boolean", "default": False, "description": "Required true when target='all', even if A2S reports quiet/unknown."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true (executes code on clients)."},
             },
-            "required": ["server", "code"],
+            "required": ["server", "code", "target"],
         },
     },
     {
         "name": "srcds_power",
-        "description": "Power-control a server via the Pterodactyl wings API (start/stop/restart/kill) — graceful, like the panel button: a stop/restart is a NORMAL quit (exit 0, NOT flagged as a crash) and the server reliably comes back up; wings `start` even recreates a removed container. Requires confirm=true; stopping/restarting/killing a LIVE server additionally needs force=true. start/restart also arm a host-side BOOT WATCHER keyed to Pterodactyl's own boot marker (wings state starting->running); then action='watch' with wait=50 (read-only, no confirm) long-polls and returns as soon as the boot completes — call it after every start/restart instead of polling srcds_status. (Falls back to raw docker only if wings is unreachable.)",
+        "description": "Power-control through the Pterodactyl wings API. Requires confirm=true. stop/restart/kill additionally require force=true whenever any players are connected OR A2S population is unknown (fail closed). start/restart arm a boot watcher; action='watch' polls it read-only. Falls back to raw docker only if wings is unreachable.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2561,7 +4134,7 @@ TOOLS = [
                 "action": {"type": "string", "enum": ["start", "stop", "restart", "kill", "watch"],
                            "description": "'watch' = check/await boot completion after a start/restart (read-only)."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true to perform start/stop/restart/kill (not needed for watch)."},
-                "force": {"type": "boolean", "default": False, "description": "Required to stop/restart/kill a LIVE server."},
+                "force": {"type": "boolean", "default": False, "description": "Required to stop/restart/kill when players are connected or population is unknown."},
                 "watch": {"type": "boolean", "default": True, "description": "Arm the boot watcher after start/restart."},
                 "wait": {"type": "integer", "default": 0, "description": "action='watch': long-poll up to this many seconds (max 55) for BOOT COMPLETE before returning."},
             },
@@ -2569,10 +4142,38 @@ TOOLS = [
         },
     },
     {
+        "name": "srcds_monitor",
+        "description": ("Arm a background watcher on the node and poll it — the easy way to be told about a "
+                        "console event or an up/down transition without tailing logs in a loop. Read-only, always "
+                        "allowed. ARM (one call): pattern:'<python regex>' (e.g. '(?i)lua error') follows the live "
+                        "container console on ANY server (no -condebug needed); or watch:'down'/'up' fires on the "
+                        "wings state transition — 'down' also captures the last 40 console lines at death (crash "
+                        "forensics). Returns an id. CHECK: id + wait<=55 long-polls and returns early on a hit; "
+                        "pass after:<seen count> to await only NEW matches. action:'stop'+id disarms; no args "
+                        "lists this server's monitors. Watchers auto-expire after timeout_min. The action field "
+                        "can usually be omitted — it is inferred (pattern/watch=arm, id=check, neither=list)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "server": SERVER_ENUM,
+                "action": {"type": "string", "enum": ["arm", "check", "stop", "list"],
+                           "description": "Optional — inferred from the other args if omitted."},
+                "watch": {"type": "string", "enum": ["pattern", "down", "up"],
+                          "description": "arm: 'pattern'=console regex (default when pattern given); 'down'/'up'=wings state transition."},
+                "pattern": {"type": "string", "description": "arm: python regex searched against each ANSI-stripped console line."},
+                "timeout_min": {"type": "integer", "default": 30, "description": "arm: watcher auto-expires after this many minutes (1-240)."},
+                "id": {"type": "string", "description": "check/stop: the monitor id returned by arm."},
+                "wait": {"type": "integer", "default": 0, "description": "check: long-poll up to this many seconds (<=55), returning early on a hit."},
+                "after": {"type": "integer", "default": 0, "description": "check (pattern): only return early when match_count EXCEEDS this — pass the count you already saw."},
+            },
+            "required": ["server"],
+        },
+    },
+    {
         "name": "srcds_db_query",
-        "description": ("Run SQL against the game MariaDB (via docker exec; root password stays inside the "
-                        "container). SELECT/SHOW/DESCRIBE/EXPLAIN run automatically; INSERT/UPDATE/DELETE/DDL "
-                        "require confirm=true (they change LIVE player data). `database` accepts a raw schema "
+        "description": ("Run SQL against the game MariaDB (credentials stay inside the container). Classified "
+                        "SELECT/SHOW/DESCRIBE/EXPLAIN reads run inside a READ ONLY transaction; writes, WITH, "
+                        "and MariaDB/MySQL executable comments require confirm=true. `database` accepts a raw schema "
                         "name OR any alias defined in db_aliases in config.json.%s Output is TSV by default "
                         "(token-lean; tabs/newlines in values are escaped); format='table' for a bordered "
                         "human-readable table. Capped ~40KB — add LIMIT for big tables." % _ALIAS_TXT),
@@ -2580,7 +4181,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "database": {"type": "string", "description": "Raw schema name, or an alias from db_aliases in config.json. Omit for a server-agnostic query (e.g. information_schema)."},
-                "sql": {"type": "string", "description": "The SQL. e.g. \"SELECT * FROM ninv_items WHERE owner='STEAM_0:..' LIMIT 20\"."},
+                "sql": {"type": "string", "description": "The SQL. e.g. \"SELECT * FROM inventory_items WHERE owner='STEAM_0:..' LIMIT 20\"."},
                 "format": {"type": "string", "enum": ["tsv", "table"], "default": "tsv",
                            "description": "tsv (default, token-lean) or table (bordered, for humans)."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true for any write/DDL statement."},
@@ -2600,7 +4201,77 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "srcds_mongo_query",
+        "description": ("Run a mongosh script against the game MongoDB (credentials stay inside the container).%s "
+                        "Because arbitrary JavaScript cannot be proven read-only, every srcds_mongo_query call "
+                        "requires confirm=true; use srcds_mongo_schema for unconfirmed structured inspection. "
+                        "The script is evaluated like a mongosh "
+                        "REPL line, so the last expression's value is printed: `db.mail.find({to:'765..'})"
+                        ".limit(5)` works as-is; use print()/EJSON.stringify() for custom output. `database` "
+                        "accepts a raw db name OR an alias from mongo_aliases in config.json.%s Output capped "
+                        "~40KB — always .limit() big collections." % (_MONGO_NOTE_TXT, _MONGO_ALIAS_TXT)),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "database": {"type": "string", "description": "Mongo database name, or an alias from mongo_aliases. Omit only for admin-level scripts that pick their own db."},
+                "script": {"type": "string", "description": "mongosh JavaScript. e.g. \"db.delivery_orders.find({status:7}).sort({created_at:-1}).limit(10).toArray()\"."},
+                "format": {"type": "string", "enum": ["shell", "json"], "default": "shell",
+                           "description": "shell (default, mongosh's compact human/BSON-typed rendering) or json (--json=relaxed, strict Extended JSON)."},
+                "confirm": {"type": "boolean", "default": False, "description": "Required true for every arbitrary mongosh script."},
+            },
+            "required": ["script"],
+        },
+    },
+    {
+        "name": "srcds_mongo_schema",
+        "description": ("Browse the MongoDB schema (read-only, always allowed): no args → list databases with "
+                        "sizes; database only → its collections with doc counts + data/index KB; "
+                        "database+collection → field names with inferred BSON types and presence counts "
+                        "(sampled), indexes, and one sample document. `database` accepts the same aliases as "
+                        "srcds_mongo_query.%s" % _MONGO_ALIAS_TXT),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "database": {"type": "string", "description": "Mongo database name or alias. Omit to list all databases."},
+                "collection": {"type": "string", "description": "Collection to describe (fields + indexes + sample doc)."},
+                "sample": {"type": "integer", "default": 25, "description": "How many docs to sample for field inference (1-200). Mongo is schemaless — a bigger sample finds rarer fields."},
+            },
+        },
+    },
 ]
+
+
+_EXPECTED_SCHEMA = {"type": "string", "pattern": "^(?:[0-9a-f]{64}|missing)$",
+                    "description": "SHA-256 of the original remote bytes used as the edit base. Use 'missing' only for a new path. Never attach a fresh hash to stale content."}
+_BACKUP_ID_SCHEMA = {"type": "string", "pattern": "^(?:[0-9]{20}-[0-9a-f]{16}|legacy)$",
+                     "description": "Restore source version from fetch history/backups; required for restore."}
+for _schema_tool in TOOLS:
+    _props = _schema_tool["inputSchema"]["properties"]
+    if _schema_tool["name"] == "srcds_deploy":
+        _schema_tool["description"] = ("Guarded file deployment. SINGLE: to + expected_sha256 + exactly one of local/content. "
+            "BATCH: files=[{to,expected_sha256,local|content},...] in one call. Fresh target resolution, per-volume lock, "
+            "whole-batch stale-base preflight, immutable backups and durable per-file history. Restore requires "
+            "expected_sha256 and backup_id and preserves the displaced file. Requires confirm=true. "
+            "64MiB/file, 256MiB/batch. Runtime/client acceptance is separate from byte verification.")
+        _props["expected_sha256"] = dict(_EXPECTED_SCHEMA)
+        _props["backup_id"] = dict(_BACKUP_ID_SCHEMA)
+        _props["source_revision"] = {"type": "string", "pattern": "^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$",
+                                     "description": "Optional full Git commit hash for audit provenance."}
+        _props["files"]["description"] = "Batch entries; expected_sha256 required per file. Restore entries also need backup_id. Mutually exclusive with single-file fields."
+        _props["files"].update(minItems=1, maxItems=400)
+        _props["files"]["items"]["properties"].update(expected_sha256=dict(_EXPECTED_SCHEMA), backup_id=dict(_BACKUP_ID_SCHEMA))
+        _props["files"]["items"]["required"] = ["to", "expected_sha256"]
+        _props["restore"]["description"] = "Restore an explicit backup_id; requires current-file expected_sha256 and no local/content. The displaced current version is backed up."
+        _props["backup"].update(const=True, description="Versioned backups are mandatory. False is rejected.")
+        _schema_tool["inputSchema"]["oneOf"] = [
+            {"required": ["files"], "not": {"anyOf": [{"required": [k]} for k in ("to", "local", "content", "expected_sha256", "backup_id")]}},
+            {"required": ["to", "expected_sha256"], "not": {"required": ["files"]}}]
+    elif _schema_tool["name"] == "srcds_fetch":
+        _props["what"]["enum"].append("history")
+        _props["before"] = {"type": "string", "description": "For history: opaque 'before' cursor returned by the previous page."}
+        _props["path"]["description"] += " For history/backups: optional relative path prefix filter."
+        _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' returns durable per-file deployment metadata (lines=page size, max 100; before=cursor). Backups list explicit backup_id values."
 
 DISPATCH = {
     "srcds_status": tool_status,
@@ -2613,8 +4284,11 @@ DISPATCH = {
     "srcds_nodeinfo": tool_nodeinfo,
     "srcds_clientlua": tool_clientlua,
     "srcds_power": tool_power,
+    "srcds_monitor": tool_monitor,
     "srcds_db_query": tool_db_query,
     "srcds_db_schema": tool_db_schema,
+    "srcds_mongo_query": tool_mongo_query,
+    "srcds_mongo_schema": tool_mongo_schema,
 }
 
 
@@ -2632,10 +4306,13 @@ def handle(msg):
     params = msg.get("params") or {}
 
     if method == "initialize":
+        requested = params.get("protocolVersion")
+        negotiated = requested if requested in MCP_SUPPORTED_PROTOCOLS else MCP_PROTOCOL_VERSION
         send({"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+            "protocolVersion": negotiated,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "srcds-mcp", "version": "1.5.0"},
+            "serverInfo": {"name": "srcds-mcp", "version": MCP_VERSION},
+            "instructions": MCP_INSTRUCTIONS,
         }})
         return
     if method == "notifications/initialized" or method == "initialized":

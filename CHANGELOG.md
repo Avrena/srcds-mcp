@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.0.0 — Guarded deployments and durable history
+
+Deployment protocol v2 prevents an older working copy from silently overwriting
+another deployment when callers retain the hash of the original edit base.
+
+- **Breaking: required base hashes.** Single and batch writes require
+  `expected_sha256` per file; creation uses `"missing"`. One stale member rejects
+  the whole batch before any file or backup changes. Fetch/download/diff expose
+  full SHA-256 for retaining the original base with the working copy.
+- **Fresh target resolution and shared locking.** Failed or ambiguous discovery
+  blocks deployment. The host independently checks the logical-to-volume mapping
+  and holds a cross-process volume lock through preflight and completion.
+- **Versioned backups and explicit restore.** Changed existing files receive
+  immutable versions outside the game tree. Restore requires a current hash and
+  `backup_id`, and preserves the displaced version. `backup=false` is rejected.
+  Existing pre-v2 backups are selectable with `backup_id="legacy"`.
+- **Durable per-file deployment history.** Prepared and final records retain
+  hashes, paths, source provenance, and deployment IDs without file payloads.
+  `srcds_fetch what="history"` supports filtering and pagination. Interrupted
+  or partial results require inspecting history and current hashes before retry.
+- **Batch comparison and bounded reads.** Multi-file diffs, multi-filter grep,
+  byte/resource limits, atomic file replacements, and realpath confinement.
+- **Explicit execution gates.** Arbitrary server Lua and mongosh scripts require
+  confirmation; local writes and file comparisons also have explicit gates.
+  Read-classified SQL runs in a read-only transaction. Power operations fail
+  closed when the player population is unknown unless explicitly forced.
+- **Acknowledged client Lua.** Explicit authenticated recipients, a readiness
+  handshake, bounded transfers, and per-client completion/error accounting.
+  Transfer success does not imply later callback or visual acceptance.
+- **Monitoring and MongoDB tools.** Configurable MongoDB query/schema access and
+  bounded monitoring with process-identity checks when stopping watchers.
+- **Offline regression suite.** Covers existing execution boundaries and the v2
+  deployment protocol, including competing processes and failure recovery.
+
+Reconnect existing MCP registrations after upgrading. Older running clients
+retain their code and schema and must be retired or blocked during cutover.
+The deployment lock does not coordinate direct SSH or other external writers;
+per-file replacements are atomic, but a batch is not a filesystem transaction.
+
 ## 1.5.0 — Batch deploy, output budgets everywhere
 Deploy a whole addon in one call; no tool can flood the context anymore.
 

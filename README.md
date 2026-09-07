@@ -1,336 +1,268 @@
 # srcds-mcp
 
-> *You gave an AI a terminal into your **live** game server. Bold. Respect.*
-> The good news: every button that can ruin your night needs a very deliberate
-> `confirm: true` first. The tool is paranoid so you don't have to be.
+A zero-dependency stdio MCP server for operating Garry's Mod/SRCDS instances
+hosted by Pterodactyl. Server names, volume markers, SSH transport, database
+aliases, and live-traffic thresholds come from `config.json`; no deployment
+identifiers or credentials are embedded in the source or documentation.
 
-An [MCP](https://modelcontextprotocol.io) server that lets Claude Code (or Codex, or
-any MCP client) drive live **Garry's Mod / srcds** servers running under
-[Pterodactyl](https://pterodactyl.io): tail logs, run console commands, execute
-server **and** client Lua, run assertion suites, deploy files, control power, and
-query the game MariaDB — as first-class tools, no manual SSH dance each time.
+The control path is:
 
-Zero dependencies. It's a single stdlib-only Python file. No `pip install`, ever.
-
----
-
-## If your AI says "the tools aren't working" — READ THIS FIRST
-
-**99% of the time, the MCP was never configured.** This tool ships with *blank*
-connection settings on purpose (so nobody's server address ends up on GitHub). Until
-**you** create a `config.json`, every tool politely refuses with a message like:
-
-```
-config: ssh.key is not set — point it at your SSH private key in config.json
-config: ssh.host is not set — edit config.json (copy config.example.json first)
-config: ssh.key does not exist: C:/path/to/your/ssh_key.pem — fix the path
+```text
+MCP client -> stdio JSON-RPC -> local srcds_mcp.py
+           -> SSH stdin -> versioned host-side Python driver
+           -> docker attach / bind-mounted volume / database container
 ```
 
-That is **not a bug**. That is the tool telling you step 3 below hasn't happened yet.
+Lua results use a framed volume-file channel, so they do not depend on
+`-condebug`. Requests cross SSH as URL-safe base64 JSON over stdin, avoiding
+shell interpolation and command-line length limits.
 
-Common failure modes, ranked by how often we've actually seen them:
+## Quick start
 
-| Symptom | What's really going on | Fix |
+Use Python 3.10+ and an SSH client locally, and Python 3 on the Linux node.
+The node must host the game volumes and have Docker available.
+
+1. Copy `config.example.json` to `config.json`. Set `ssh.host`, `ssh.key`,
+   `public_ip`, and the marker directory for each logical server. Obtain the
+   endpoint and private key from the server operator; keep the key outside this
+   repository. On Windows, use forward slashes or escaped backslashes in JSON.
+2. Check configuration with
+   `python -c "import srcds_mcp as m; print(m.config_error() or 'config OK')"`.
+3. Register the script using the absolute Python/script paths in
+   [`mcp.json.example`](mcp.json.example). It includes JSON and Codex TOML forms.
+4. Restart the MCP connection, then run `srcds_status` to check discovery.
+
+Settings load from built-in defaults, then `config.json` (or the file named by
+`SRCDS_MCP_CONFIG`), then individual `SRCDS_MCP_*` environment overrides.
+For multiple nodes, register the script separately for each node and set
+`SRCDS_MCP_CONFIG` to that registration's local configuration file. Keep all
+actual node configurations outside Git.
+
+## Tools and safety gates
+
+| Tool | Gate | Purpose |
 | --- | --- | --- |
-| Every tool returns `config: ssh.key is not set …` | No `config.json`, or `ssh.key` is blank. | Do the **Quick start** below. |
-| `config: ssh.key does not exist: …` | The path is wrong / the key isn't where you said. | Fix the path in `config.json`. |
-| `could not upload host driver over SSH` | Config is fine, but the box is unreachable. | Check VPN/network, `ssh.host`, `ssh.port`, and that the key actually works. |
-| Your AI cheerfully announced "all set up!" but nothing works | The model **hallucinated** doing the setup. It cannot invent a private key it doesn't have. | Open `config.json` yourself. If it doesn't exist, the AI lied. Create it. |
-| The tools don't appear in the client at all | MCP servers load at **client startup**. | Register per `mcp.json.example`, then **restart** the client. |
+| `srcds_status` | Always allowed | Up/down, A2S player count, threshold state, port, capture capability. Hostnames and container IDs are omitted. |
+| `srcds_fetch` | Remote reads allowed; `save_to` requires confirm | Console/container logs, confined file reads, directory listings, hashes, and deploy-backup listings. |
+| `srcds_console` | Allowlisted reads automatic; otherwise confirm | One console command. Multiline/compound commands always require confirmation. |
+| `srcds_lua` | Always confirm | Server Lua and asynchronous verification suites. Arbitrary Lua is not statically classified as safe. |
+| `srcds_deploy` | Always confirm | Single or batch writes/restores with backups and resource limits. |
+| `srcds_grep` | Always allowed | One-call bounded grep with multiple patterns, globs, exclusions, and roots. |
+| `srcds_diff` | Server-to-server automatic; local comparisons confirm | Single or batch diffs with per-file and aggregate input limits. |
+| `srcds_clientlua` | Confirm; broadcasts also require `broadcast` and `force` | Bounded client Lua delivery with transfer/compile/synchronous-runtime acknowledgements. |
+| `srcds_power` | Confirm; disruptive actions force on players or unknown population | Wings-backed start/stop/restart/kill plus boot watcher. |
+| `srcds_monitor` | Always allowed | Private-state background console/state watcher with PID identity validation on stop. |
+| `srcds_db_query` | Classified reads automatic; writes/ambiguous SQL confirm | MariaDB query; automatic reads run inside a read-only transaction. |
+| `srcds_db_schema` | Always allowed | Structured MariaDB schema inspection. |
+| `srcds_mongo_query` | Always confirm | Arbitrary mongosh JavaScript. |
+| `srcds_mongo_schema` | Always allowed | Structured MongoDB schema inspection. |
 
-> **For the human:** if you delegated setup to an LLM, verify two things with your own
-> eyes: (1) a file literally named `config.json` exists next to `srcds_mcp.py`, and
-> (2) its `ssh.key` points at a private key file that actually exists on disk. An LLM
-> can write config and register the server, but it **cannot** produce the SSH key or
-> the node address out of thin air — those come from a human. If it claims otherwise,
-> it's confabulating; check the file.
+General local operation logs redact command/code/query/target/path text, store
+aggregate lengths/modes, and rotate at 5 MiB with three retained generations.
+Deployment protocol v2 additionally keeps durable host-side per-file metadata:
+destination, source working-copy path, expected/before/after SHA-256, client
+instance and PID, available task ID, optional Git revision, and deployment ID.
+File contents, credentials, commands, and player data are not included in that
+deployment history. Existing historical logs are not rewritten.
 
-Sanity-check without launching an MCP client at all:
-```
-python -c "import srcds_mcp as m; print(m.config_error() or 'config OK')"
-```
-Prints `config OK` when you're good to go, or the exact thing to fix.
+## Deployment protocol v2 (breaking change)
 
----
+Every deployment entry, including restore, requires `expected_sha256`: the full
+SHA-256 of the **original remote bytes used as the edit base**. Downloads, file
+reads, hash listings, and diffs (`sha256_a`) expose full SHA-256. Save that hash
+alongside the working copy before editing. Use literal `"missing"` only when
+creating a path that does not exist. Do not fetch a fresh hash and attach it to
+an old candidate; first reconcile the remote changes into the candidate.
 
-## Quick start (per developer)
+Both the client and host resolve the target afresh. Ambiguous targets and failed
+discovery fail closed. The host locks the volume across all base checks, backups,
+writes, verification, and history. One stale file rejects the entire batch
+before any target or backup changes. This prevents one cooperating MCP writer
+from silently replacing another writer's newer file.
 
-1. **Python 3.8+** on PATH (or note the full path to `python.exe`).
-2. **Get the SSH key + node address** from whoever runs the servers. Save the key
-   somewhere private (e.g. `C:\Users\<you>\Documents\`). Do **not** put it in this
-   folder, and never commit it.
-3. **Make your config:**
-   ```
-   copy config.example.json config.json      # Windows
-   cp   config.example.json config.json       # macOS/Linux
-   ```
-   Open `config.json` and set at least **`ssh.key`**, **`ssh.host`**, and
-   **`public_ip`**. (On Windows use `C:/Users/you/...` or escaped `C:\\Users\\you\\...`.)
-4. **Register it with your MCP client** — see `mcp.json.example`. For Claude Code,
-   merge the `mcpServers` block into your project `.mcp.json` (or `~/.claude.json`)
-   with absolute paths to `python.exe` and `srcds_mcp.py`. For Codex, use the TOML form.
-5. **Restart the client.** MCP servers load at startup.
-6. **Smoke test:** run `srcds_status`. You should see your servers and live player counts.
+Backups are mandatory and versioned under
+`backups_root/_guard_v2/<volume>/versions/<deployment_id>/<relative-path>`.
+They are outside game trees and retained until an operator explicitly removes
+them. Identical writes are recorded as no-ops and create no redundant backup.
+Read `srcds_fetch what="backups"` or `what="history"`, optionally filtering by
+`path`. History accepts `lines` (page size, max 100) and a returned `before`
+cursor. A prepared record without a final result means the outcome is uncertain.
 
----
+Restore requires an explicit `backup_id` from those records, plus the expected
+hash of the current file, and no local/content payload. It also backs up the
+displaced current version, so restoration can be undone. To select an older
+pre-v2 backup, explicitly use `backup_id="legacy"`.
 
-## Configuration (`config.json`)
+Every file replacement is atomic. A whole batch is **not** an atomic filesystem
+transaction: an I/O failure or an unrelated writer after preflight can produce
+a partial result. Durable intent, all original backups, and the final receipt
+make that visible. Inspect history and live hashes after timeouts, partial
+results, or interrupted calls before retrying. There is no automatic rollback
+or force bypass. Direct SSH/file-manager/Lua writes do not honor this lock.
 
-Resolution order (later overrides earlier):
+After installing v2, reconnect existing MCP sessions to load the new code and
+schema. Previously launched Python processes retain old code; they must be
+retired or otherwise blocked before considering the cutover complete. Retire
+only idle MCP helpers and fence known cached legacy host drivers against writes.
+Other machines using separate MCP installations also need upgrading; this is
+a concurrency guard for the deployment route, not an access-control boundary
+against clients with arbitrary root SSH or server-Lua privileges.
 
-1. built-in `DEFAULTS` in `srcds_mcp.py` (blank connection settings on purpose)
-2. `config.json` next to the script (or the path in `$SRCDS_MCP_CONFIG`)
-3. individual `SRCDS_MCP_*` environment variables (handy for CI / one-offs)
+## Batch-first file operations
 
-| Key | What | Who sets it |
-| --- | --- | --- |
-| `ssh.key` | Path to **your** SSH private key. **Required.** | you |
-| `ssh.host` / `ssh.port` | SSH endpoint of the node, e.g. `root@1.2.3.4` : `22`. **Required.** | you |
-| `public_ip` | Public game IP, for A2S player counts. | you |
-| `ssh.bin` | `ssh` on PATH, or a full path to `ssh.exe`. | usually default |
-| `ssh.known_hosts` | Blank ⇒ `~/.ssh/known_hosts`. | usually blank |
-| `volroot` / `backups_root` | Pterodactyl volumes root; out-of-tree deploy backups. | default (standard Ptero) |
-| `wings.api` / `wings.config` | Wings power API + config path (for the bearer token). | default (standard Ptero) |
-| `owner_uid` / `owner_gid` | `chown` target for deployed files (`pterodactyl:pterodactyl`). | default |
-| `panel_url` | Pterodactyl panel URL (shown in power errors). | optional |
-| `live_thresholds` | Player count per server that counts as "LIVE". | optional |
-| `servers` | Topology: marker dir under `garrysmod/` → logical name (first match wins). | you |
-| `db_aliases` | DB-tool aliases: game name → MariaDB schema. Optional (raw names work). | optional |
+When comparing or deploying more than one file, use a single batch call. The
+server advertises this rule during MCP initialization.
 
-Env overrides: `SRCDS_MCP_SSH_KEY`, `SRCDS_MCP_SSH_BIN`, `SRCDS_MCP_SSH_HOST`,
-`SRCDS_MCP_SSH_PORT`, `SRCDS_MCP_KNOWN_HOSTS`, `SRCDS_MCP_PUBLIC_IP`, and
-`SRCDS_MCP_CONFIG` (path to an alternate config file).
+```text
+srcds_diff {
+  server: "game",
+  confirm: true,
+  files: [
+    {path: "addons/x/lua/a.lua", local: "C:/work/x/lua/a.lua"},
+    {path: "addons/x/lua/b.lua", local: "C:/work/x/lua/b.lua"}
+  ]
+}
 
-**Topology matters.** Each `servers[]` entry maps a marker directory (something that
-uniquely exists under that server's `garrysmod/`, e.g. a signature addon or its
-gamemode folder) to a logical name. UUIDs, ports, and up/down state are all resolved
-**live** (`docker ps` + `SERVER_PORT`), so only the marker→name mapping is config.
+srcds_diff {
+  server: "game-a",
+  server_b: "game-b",
+  files: [{path: "addons/x/lua/a.lua"}, {path: "addons/x/lua/b.lua"}]
+}
 
-The host-side facts (`volroot`, `backups_root`, `wings.*`, `owner_*`, `servers`) are
-baked into the uploaded host driver, so the driver is byte-identical across everyone
-on the same node (stable content hash); a different deployment yields a different,
-correctly-namespaced driver.
-
-### Adding a server
-
-A new game server on the same node is pure config — no code changes:
-
-1. Pick a **marker**: a directory that uniquely exists under that server's
-   `garrysmod/` (its gamemode folder, or a signature addon).
-2. Add it to `config.json`:
-   ```json
-   "servers": [
-     { "logical": "scprp",  "marker": "addons/your-scp-addon" },
-     { "logical": "breach", "marker": "gamemodes/breach" }
-   ]
-   ```
-3. Optionally give it a `live_thresholds` entry (`"breach": 10`) and a
-   `db_aliases` entry for its schema.
-4. **Restart your MCP client.** The server-name enum and the tool descriptions
-   are baked at startup, so the new name only appears after a restart.
-
-That's it — UUID, port, and up/down state are discovered live, so the new name
-simply starts resolving.
-
-### Multiple nodes
-
-One instance of this server talks to **one** node (`ssh.host`). For a second
-node, register `srcds_mcp.py` a **second time** under a different name, with
-`SRCDS_MCP_CONFIG` pointing at a second config file:
-
-```json
-"mcpServers": {
-  "srcds": {
-    "command": "C:/.../python.exe", "args": ["C:/.../srcds-mcp/srcds_mcp.py"]
-  },
-  "srcds-nodeb": {
-    "command": "C:/.../python.exe", "args": ["C:/.../srcds-mcp/srcds_mcp.py"],
-    "env": { "SRCDS_MCP_CONFIG": "C:/.../srcds-mcp/config.nodeb.json" }
-  }
+srcds_deploy {
+  server: "game",
+  confirm: true,
+  files: [
+    {to: "addons/x/lua/a.lua", local: "C:/work/x/lua/a.lua", expected_sha256: "<saved original SHA-256>"},
+    {to: "addons/x/lua/b.lua", local: "C:/work/x/lua/b.lua", expected_sha256: "<saved original SHA-256>"}
+  ]
 }
 ```
 
-MCP clients namespace tools per registration, so both fleets coexist (e.g. in
-Claude Code: `mcp__srcds__srcds_status` vs `mcp__srcds-nodeb__srcds_status`).
-Each instance uploads its own hash-namespaced driver and writes its own log
-(`config.nodeb.json.log`). Per-node config files match the `config*.json`
-gitignore rule, so they can't be committed by accident either.
+Local diff contents cross the SSH boundary to the comparison driver, so local
+comparisons require `confirm:true`. Server-to-server comparisons remain
+read-only and do not require confirmation. Diff limits are 16 MiB per side and
+64 MiB aggregate per batch. Deploy limits are 64 MiB per file and 256 MiB per
+batch.
 
----
+For trees, call `srcds_fetch` with `what:"hash"`, compare the listings, then
+batch-diff only mismatches.
 
-## Why it's built the way it is
+## Multi-filter grep
 
-Servers commonly run **`-norcon`** (classic Source RCON off) with stdin owned by the
-Pterodactyl wings daemon. The reliable control path is: **SSH → `pty.fork(docker
-attach)` injection**. Reading results back differs by channel:
+Singular fields remain compatible. Array fields combine filters in one bounded
+host invocation:
 
-- **`srcds_console`** reads the `-condebug` `console.log` delta where available;
-  on servers without `-condebug` it captures the reply live off the attached pty
-  during the injection window instead — no server is blind. For console *history*
-  without `-condebug` (or while a server is down), `srcds_fetch what:"docker"`
-  tails the container's docker log.
-- **`srcds_lua`** does **not** depend on `-condebug`. The injected runner `file.Write`s
-  its framed output to `data/_mcp/<token>.txt` on the volume, which the host driver
-  reads directly off the bind-mounted volume. So **Lua/verification output is captured
-  on every server**, with no console 4 KB line limit and none of the live console's
-  other-player spam.
-
-```
-MCP client ──stdio JSON-RPC──> srcds_mcp.py (your machine, zero-dep, stdlib only)
-                                   │  ssh -i <your key> <ssh.host>:<ssh.port>
-                                   ▼
-                           /tmp/srcds_host_driver_<hash>.py (python3 on the node)
-                                   │  pty.fork → docker attach → lua_openscript
-                                   ▼
-                           srcds runner ──file.Write──> data/_mcp/<token>.txt
-                                   ▲                           │
-                                   └── driver reads volume ────┘  (works w/o -condebug)
+```text
+srcds_grep {
+  server: "game",
+  patterns: ["RegisterNetReceiver", "net.Receive"],
+  globs: ["*.lua", "*.txt"],
+  exclude_globs: ["*_test.lua", "vendor_*"],
+  paths: ["addons/one", "gamemodes/two"],
+  max: 300
+}
 ```
 
-The request crosses the SSH boundary as **urlsafe-base64 JSON over stdin** (never the
-command line), so no shell-quoting layer can mangle Lua/commands **and large payloads
-don't hit the Windows ~32 KB command-line limit**.
+`patterns[]` are OR alternatives (`grep -e` semantics). `globs[]` are OR
+include filters. `exclude_globs[]` removes filename matches. Output capture is
+bounded at the pipe, so a broad match or one minified line cannot allocate an
+unbounded subprocess buffer.
 
----
+## Server Lua verification
 
-## Tools
+Every `srcds_lua` call requires `confirm:true`. The runner supplies:
 
-| Tool | Gate | What |
-| --- | --- | --- |
-| `srcds_status` | always allowed | up/down, **live player count (A2S)**, LIVE flag vs thresholds, port, condebug |
-| `srcds_fetch` | always allowed | tail `console.log` or the **docker log** (console history, no `-condebug` needed), read a file (or `save_to` = binary-safe download), list a dir, `sha1` a subtree, or list deploy backups; ANSI stripped, byte-capped |
-| `srcds_console` | confirm if destructive | inject a console command; reply captured on every server — console.log delta with `-condebug`, live pty capture without (ANSI-stripped, byte-capped) |
-| `srcds_lua` | confirm if mutating | run server Lua / **multi-line verification suites**; captures output + `return <expr>` with an assertion harness |
-| `srcds_deploy` | confirm | write files to the volume — single (`to` + `local`/`content`) or **batch** (`files:[{to, local\|content}, …]`: one confirm, one SSH round-trip, per-file report; batch `restore:true` rolls it all back); UTF-8/CJK-safe, backs up overwrites **out-of-tree**, `.lua` hot-reloads, works even if server DOWN |
-| `srcds_grep` | always allowed | recursive `grep` across the **deployed** volume source (find symbols / local-vs-remote divergence) |
-| `srcds_diff` | always allowed | unified diff of a deployed file vs another server's copy or vs a **local** file — divergence checks before deploying |
-| `srcds_nodeinfo` | always allowed | host health: load, memory, disk, docker stats; optional wings-log / dmesg tails for crash & OOM forensics |
-| `srcds_clientlua` | confirm | run **clientside** Lua on connected players (chunked base64 `SendLua`); UI/PAC3 hot-reload without reconnect |
-| `srcds_power` | confirm (+force if LIVE) | wings-API start/stop/restart/kill (graceful, not a crash); `action:"watch"` awaits boot completion |
-| `srcds_db_query` | read auto / write confirm | SQL against the game MariaDB; SELECT/SHOW auto, INSERT/UPDATE/DELETE/DDL need confirm |
-| `srcds_db_schema` | always allowed | browse databases → tables (row counts) → columns/indexes |
-
-Dev loop: **`srcds_grep`** (find) → **`srcds_diff`** (check divergence) → edit
-locally → **`srcds_deploy`** (push, autorefresh reloads) → **`srcds_lua`** suite
-(verify) → **`srcds_clientlua`** (push clientside) → **`srcds_power`** (boot a
-server that's off) — and `srcds_deploy {restore:true}` if the push went wrong.
-
-### Examples
-- `srcds_status` → table of all servers.
-- `srcds_lua {server:"scprp", code:"return player.GetCount()"}` → `0`.
-- `srcds_console {server:"scprp", command:"status", grep:"players"}`.
-- `srcds_fetch {server:"scprp", what:"file", path:"cfg/server.cfg"}`.
-- `srcds_deploy {server:"scprp", to:"addons/x/lua/autorun/server/y.lua", local:"C:/.../y.lua", confirm:true}`.
-- `srcds_deploy {server:"scprp", files:[{to:"addons/x/a.lua", local:"C:/.../a.lua"}, {to:"addons/x/b.lua", content:"..."}], confirm:true}` — batch: many files, one call.
-
-*(`scprp` here is just whatever you named a server in `config.json` → `servers`.)*
-
-### Boot watch (know when a start/restart is actually done)
-
-A GMod server takes minutes to boot; the wings power call returns in seconds.
-`start`/`restart` therefore arm a small detached **boot watcher** on the node.
-The boot marker is owned by the **Pterodactyl end**: wings flips the server
-state `starting → running` when the egg's startup-done line appears in the
-console — the watcher just records that transition. Then:
-
-```
-srcds_power {server:"scprp", action:"watch", wait:50}
+```text
+SECTION(name)  CHECK(cond,msg)  EQ/NEQ/NEAR  TRUE/FALSE/OK
+THROWS(fn,msg) DUMP(value)      LOG(...)     MCP_DONE()
 ```
 
-is read-only (no confirm) and **returns early the moment the boot completes** —
-`BOOT COMPLETE: ... running 87.3s after the power action` — or reports
-`still booting` / `DIED DURING BOOT` (with the state history) / a 15-minute
-timeout. For an AI client this *is* the boot notification: call `watch` with
-`wait:50` in a loop instead of polling `srcds_status`.
+It captures output and return values, preserves user line numbers, limits
+instructions/output/failure detail, and treats missing start/end markers as an
+error. Asynchronous suites set `async:true` and call `MCP_DONE()` from the final
+callback. Helper functions and finalization state are isolated per runner, so
+overlapping async requests cannot finalize or log into one another.
 
-### Database (MariaDB)
-If the node runs a `mariadb` container, the DB tools query it via `docker exec` and
-read the root password from the container's own `$MYSQL_ROOT_PASSWORD` — **the
-password is never extracted, hardcoded, or logged**. `database` accepts a raw schema
-name or any alias you define in `db_aliases`. Reads run automatically; a write/DDL is
-blocked until `confirm:true`. Output is **TSV by default** (token-lean for AI
-clients; tabs/newlines in values are escaped) — pass `format:"table"` for a
-bordered table. Capped ~40 KB — add a `LIMIT`.
+## Client Lua transport
 
----
+`srcds_clientlua` no longer treats `SendLua` queueing as execution:
 
-## Verification suites (`srcds_lua`)
+1. `target` is required and accepts only exact SteamID/SteamID64 or `all`.
+2. Raw UTF-8 source is capped at 64 KiB; bots and not-yet-authenticated players
+   are excluded, and recipients are capped at 128.
+3. A short `SendLua` bootstrap installs a fixed client receiver and returns a
+   per-request ready signal.
+4. Only after that ready signal, the server sends tokenized, optionally
+   compressed net chunks with length and checksum metadata.
+5. Each client reports `ok`, `transfer_error`, `compile_error`, or
+   `runtime_error` for the synchronous top-level chunk; missing or inconsistent
+   acknowledgements mark the tool call as an error.
 
-`srcds_lua` is built for **multi-line assertion suites**, not just one-liners. Your
-code runs **verbatim** (errors report *your* line numbers), with injected globals:
+Broadcast example:
 
-```
-SECTION(name)            EQ(a, b, msg)      NEAR(a, b, eps, msg)   THROWS(fn, msg) -> err
-CHECK(cond, msg)         NEQ(a, b, msg)     TRUE(v, msg) FALSE OK  DUMP(v) -> string
-LOG(...)                 MCP_DONE()  -- async only
-```
-
-Each failing check emits a `[FAIL]` line with `got=`/`want=`; a `checks: p=X f=Y`
-summary is returned and **any failure makes the call an error**. A top-level `return
-<expr>` (numbers/strings/booleans/**tables**) is safely serialized (entities/vectors
-tagged; cycles & functions never crash).
-
-```lua
--- srcds_lua {server="scprp", code = [[
-SECTION("site state")
-local n = player.GetCount()
-CHECK(n >= 0 and n <= game.MaxPlayers(), "player count in range")
-NEQ(game.GetMap(), "", "map present")
-LOG("map=", game.GetMap(), "players=", n)
-return { map = game.GetMap(), players = n }
-]]}
+```text
+srcds_clientlua {
+  server: "game",
+  target: "all",
+  code: "print('diagnostic')",
+  confirm: true,
+  broadcast: true,
+  force: true
+}
 ```
 
-Internals: the body is `CompileString`'d (NOT `include()`, which swallows errors)
-inside a `setfenv` sandbox; a `debug.sethook` instruction budget aborts runaway loops
-*before* HolyLib's 10 s hang-kill; output is framed `__MCP~|~<token>~|~KIND~|~<b64>`
-lines `file.Write`n to `data/_mcp/<token>.txt` (works on every server regardless of
-`-condebug`). For timer/coroutine suites pass `async=true` and call `MCP_DONE()`.
+An acknowledgement is client-reported transfer, compile, and synchronous
+top-level execution evidence only. Later timers/callbacks, UI appearance,
+rendering, interaction, and player-visible correctness still require a real
+client or human acceptance check.
 
----
+## Database boundaries
 
-## Safety model
-- `srcds_status` / `srcds_fetch` / `srcds_grep` / `srcds_db_schema` are read-only → always run.
-- `srcds_console` / `srcds_lua` run automatically **unless** the command/code matches
-  the destructive/mutating denylist (kick, ban, changelevel, map, `*_password`,
-  restart, `:SetHealth`, `:Give`, `file.Write`, `RunConsoleCommand`, …) — then they're
-  **blocked** until re-called with `confirm:true`. The block message includes the live
-  player count. The denylist is a backstop heuristic, not a sandbox.
-- `srcds_deploy` / `srcds_clientlua` / `srcds_power` always require `confirm:true`.
-  `srcds_deploy` is path-guarded (no `..`/absolute escape out of `garrysmod/`) and
-  backs up overwrites. `srcds_power` additionally needs `force:true` to
-  stop/restart/kill a **LIVE** server.
-- `srcds_db_query` runs SELECT/SHOW/DESCRIBE/EXPLAIN automatically but blocks any
-  write/DDL until `confirm:true`. DB names are regex-validated and SQL crosses via
-  stdin (no shell injection).
-- Every call is appended to `srcds_mcp.log` (next to the script, git-ignored).
+MariaDB read classification rejects executable comments and ambiguous leading
+forms such as `WITH`. Automatic reads run inside `START TRANSACTION READ ONLY`
+and finish with `ROLLBACK`. Writes and ambiguous SQL require `confirm:true`.
+`srcds_db_schema` uses generated read-only statements.
 
----
+Arbitrary mongosh JavaScript cannot be safely proven read-only with a method
+regex, so every `srcds_mongo_query` call requires `confirm:true`.
+`srcds_mongo_schema` remains an unconfirmed, generated read-only inspection
+tool.
 
-## Security notes (please read before you `git push`)
-- **Never commit `config.json` or your SSH key.** Both are in `.gitignore`. `config.json`
-  holds your node address; the key is the keys to the kingdom.
-- The private key lives on your machine only and is referenced **by path**. This repo
-  contains no keys, no real IPs, and no live endpoints — you supply them locally.
-- Tools that mutate are confirm-gated, but the denylist is a *heuristic*, not a jail.
-  Treat `confirm:true` on a live server with the respect it deserves.
+Credentials remain inside their containers and are never returned or logged.
 
----
+## Filesystem and process boundaries
 
-## Troubleshooting
-- **`config: …`** → see the big "READ THIS FIRST" section above.
-- **"could not upload host driver / SSH failed"** → network/VPN to the node, the key
-  path, and that your `ssh.bin` exists.
-- **"server DOWN"** → boot it with `srcds_power {server:"<name>", action:"start", confirm:true}`,
-  then `srcds_power {server:"<name>", action:"watch", wait:50}` until it says `BOOT COMPLETE`.
-- **Lua syntax error** → captured as a framed `ERR` carrying your own body line number;
-  the call is marked `isError`.
-- **`srcds_power`** drives the **wings API** (same path as the panel buttons), so a
-  stop/restart is a *normal quit* (exit 0, not flagged as a crash) and the server
-  reliably comes back. Raw `docker` is only a fallback if wings is unreachable.
-- Inspect `srcds_mcp.log` for a JSONL trace of every call.
+Remote paths use `realpath` plus `commonpath`, rejecting prefix-collision and
+symlink escapes. Local `save_to` requires an absolute path, `confirm:true`, and
+`overwrite:true` if the destination exists.
 
----
+Monitor state lives in a root-only directory. Stopping a watcher verifies its
+PID start time, process-group leadership, and per-process nonce before sending a
+signal, preventing stale-state PID reuse from killing an unrelated process.
 
-See `CHANGELOG.md` for version history. Built for Pterodactyl-hosted GMod servers;
-adapt the config to your own fleet.
+## Configuration and reload
+
+Copy `config.example.json` to `config.json`, then set the SSH key path, SSH
+endpoint, server marker topology, and optional DB/Mongo aliases. Keep private
+endpoints, keys, and identifiers out of committed documentation.
+
+MCP clients load stdio servers at startup. After editing `srcds_mcp.py`, restart
+or reconnect every configured MCP registration. Until reconnection, the client
+continues exposing the old tool schema and initialization instructions.
+
+## Validation
+
+The regression suite is offline and never connects to a game server:
+
+```text
+python -m unittest discover -p "test*.py" -v
+```
+
+It covers confirmation bypasses, executable SQL comments, acknowledged
+clientlua failure paths, fail-closed power control, local-write confirmation,
+multi-filter grep request composition, MCP protocol negotiation, concurrent
+deployment conflicts, whole-batch preflight, target resolution, versioned
+restore, backup integrity, and durable-history failure handling. The host
+tests use temporary directories; they do not require a live game server.
+The symlink test skips on Windows when the process cannot create symlinks.

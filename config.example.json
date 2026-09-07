@@ -1,35 +1,36 @@
 {
-  "_comment": "Copy this file to config.json and fill in ssh.key + ssh.host + public_ip. config.json is git-ignored and must NEVER be committed. The SSH private key itself is NOT in this repo - get it, and the node address, from your team lead. Everything else has sane defaults for a standard Pterodactyl node.",
-
+  "_comment": "Copy this file to config.json and replace every example value. Do not commit private keys, endpoints, or production identifiers.",
   "ssh": {
-    "bin": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
-    "key": "C:/path/to/your/ssh_key.pem",
-    "known_hosts": "",
-    "host": "root@YOUR_NODE_IP",
+    "bin": "ssh",
+    "key": "C:/path/to/your/private-key",
+    "known_hosts": "C:/Users/you/.ssh/known_hosts",
+    "host": "root@example-host",
     "port": "22"
   },
-
-  "public_ip": "YOUR_NODE_IP",
-
+  "public_ip": "203.0.113.10",
   "volroot": "/var/lib/pterodactyl/volumes",
   "backups_root": "/var/lib/pterodactyl/srcds_mcp_backups",
-
   "wings": {
     "api": "http://127.0.0.1:8081",
     "config": "/etc/pterodactyl/config.yml"
   },
   "owner_uid": 999,
   "owner_gid": 987,
-
-  "panel_url": "https://your-panel.example.com",
-
-  "live_thresholds": { "scprp": 50, "drp": 20, "zcity": 3 },
-
+  "panel_url": "https://panel.example.invalid",
+  "live_thresholds": {
+    "game": 1
+  },
   "servers": [
-    { "logical": "scprp", "marker": "addons/your-scp-addon" },
-    { "logical": "zcity", "marker": "addons/your-city-addon" },
-    { "logical": "drp",   "marker": "gamemodes/darkrp" }
+    {
+      "logical": "game",
+      "marker": "gamemodes/example"
+    }
   ],
-
-  "db_aliases": { "scprp": "your_scprp_schema", "drp": "your_drp_schema" }
+  "db_aliases": {},
+  "mongo": {
+    "container": "",
+    "auth_db": "admin",
+    "note": ""
+  },
+  "mongo_aliases": {}
 }
