@@ -2995,6 +2995,17 @@ DIFF_BATCH_MAXBYTES = 200000
 # server in a sliding window and, past the threshold, tell it to batch. Advisory
 # only — never blocks (re-deploying the SAME file repeatedly is a legit dev loop
 # and doesn't trip this, since distinct paths are what's counted).
+_ONCE_SHOWN = set()
+
+
+def _once(key, text):
+    """Standing guidance costs tokens on every call; say it once per process."""
+    if key in _ONCE_SHOWN:
+        return ""
+    _ONCE_SHOWN.add(key)
+    return text
+
+
 SINGLE_TRICKLE_WINDOW = 240.0   # seconds
 SINGLE_TRICKLE_AT = 3           # distinct files before the nudge fires
 _recent_singles = {}            # server -> {to: last_deploy_time}
@@ -3136,14 +3147,22 @@ def tool_deploy(args):
             msg += "\nInspect fetch what='history' and live hashes before retrying; files may already have changed."
         return (msg, True)
     results = res.get("results") or [res]
-    msg = "[%s] %s %d file(s), %d changed bytes; deployment_id=%s" % (
-        server.upper(), "restored" if restore else "deployed", len(results), res.get("bytes", 0), deploy_id)
-    for r in results:
-        msg += "\n%s: sha256=%s%s%s" % (r.get("to"), r.get("after_sha256"),
-               " (unchanged)" if r.get("noop") else "",
-               " backup_id=" + r["backup_id"] if r.get("backup_id") else "")
+    changed = [r for r in results if not r.get("noop")]
+    n_new = sum(1 for r in changed if r.get("before_sha256") == "missing")
+    counts = ", ".join("%d %s" % (n, k) for k, n in (
+        ("new", n_new), ("replaced", len(changed) - n_new), ("unchanged", len(results) - len(changed))) if n)
+    msg = "[%s] %s %d file(s) (%s), %d changed bytes; deployment_id=%s%s" % (
+        server.upper(), "restored" if restore else "deployed", len(results), counts,
+        res.get("bytes", 0), deploy_id, "; sha256 after:" if changed else "")
+    for r in changed:
+        msg += "\n%s  %s%s" % (r.get("to"), r.get("after_sha256"),
+                               "  new" if r.get("before_sha256") == "missing" else "")
+    if len(changed) > n_new:
+        msg += _once("deploy-backup", "\nReplaced files are backed up under backup_id=<deployment_id>.")
+    if len(changed) < len(results):
+        msg += _once("deploy-unchanged", "\nUnchanged files are not listed: their sha256 is the expected_sha256 you sent.")
     if any(e["to"].endswith(".lua") for e in entries):
-        msg += "\nSource bytes verified; runtime reload and client behavior still require verification."
+        msg += _once("deploy-lua", "\nSource bytes verified; runtime reload and client behavior still require verification.")
     return (msg, False)
 
 
@@ -3213,19 +3232,19 @@ def tool_grep(args):
 
 
 def _format_diff_result(req, res):
-    head = "[diff] %s  vs  %s" % (req["label_a"], req["label_b"])
-    head += "\nsha256_a=%s sha256_b=%s\n" % (res.get("sha256_a"), res.get("sha256_b"))
+    head = "[diff] %s vs %s" % (req["label_a"], req["label_b"])
     if res.get("equal"):
-        return head + " — IDENTICAL (%s bytes, sha1 %s)" % (res.get("size_a"), res.get("sha_a"))
+        return "%s: IDENTICAL (%s bytes)\nsha256=%s" % (head, res.get("size_a"), res.get("sha256_a"))
+    sizes = "%s vs %s bytes" % (res.get("size_a"), res.get("size_b"))
+    hashes = "sha256_a=%s sha256_b=%s" % (res.get("sha256_a"), res.get("sha256_b"))
     if res.get("binary"):
-        return head + " — BINARY files DIFFER: %s vs %s bytes (sha1 %s vs %s)" % (
-            res.get("size_a"), res.get("size_b"), res.get("sha_a"), res.get("sha_b"))
+        return "%s: BINARY, DIFFER (%s)\n%s" % (head, sizes, hashes)
     cap = "  [truncated by output budget]" if res.get("truncated") else ""
     diff = res.get("diff", "")
-    if not diff:
-        diff = "[no textual diff rendered; sha1 %s vs %s]" % (res.get("sha_a"), res.get("sha_b"))
-    return head + " — DIFFER (%s vs %s bytes)%s\n%s" % (
-        res.get("size_a"), res.get("size_b"), cap, diff)
+    if diff.startswith("--- "):
+        # The header already names both sides; drop difflib's ---/+++ lines.
+        diff = diff.split("\n", 2)[2] if diff.count("\n") >= 2 else ""
+    return "%s: DIFFER (%s)%s\n%s\n%s" % (head, sizes, cap, hashes, diff or "[no textual diff rendered]")
 
 
 def _diff_local_entry(server, srv, path, local, context):
@@ -3307,29 +3326,27 @@ def _diff_batch(server, srv, args, files):
     if not res.get("ok"):
         return ("batch diff failed: %s" % res.get("error"), True)
     results = res.get("results") or []
-    n_equal = res.get("n_equal", 0)
-    n_differ = res.get("n_differ", 0)
-    n_fail = res.get("n_fail", 0)
-    msg = ("[batch diff] %s vs %s — %d files: %d IDENTICAL, %d DIFFER, %d FAILED; "
-           "one SSH round-trip" % (server, server_b or "local", len(entries), n_equal, n_differ, n_fail))
+    n_equal = n_differ = n_fail = 0
     details = []
     for i, entry in enumerate(entries):
-        if i >= len(results):
-            details.append("FAILED  %s  vs  %s — missing driver result" %
-                           (entry["label_a"], entry["label_b"]))
-            n_fail += 1
-            continue
-        item = results[i]
+        item = results[i] if i < len(results) else {"ok": False, "error": "missing driver result"}
         if not item.get("ok"):
-            details.append("FAILED  %s  vs  %s — %s" %
-                           (entry["label_a"], entry["label_b"], item.get("error")))
+            n_fail += 1
+            details.append("[diff] %s vs %s: FAILED: %s" % (entry["label_a"], entry["label_b"], item.get("error")))
+        elif item.get("equal"):
+            n_equal += 1                 # the caller knows which files it sent
         else:
+            n_differ += 1
             details.append(_format_diff_result(entry, item))
+    msg = "[batch diff] %s vs %s: %d files, %d identical, %d differ, %d failed" % (
+        server, server_b or "local", len(entries), n_equal, n_differ, n_fail)
+    if n_equal:
+        msg += _once("diff-identical", " (identical files are not listed; srcds_fetch what='hash' prints their SHA-256)")
     if details:
         msg += "\n\n" + "\n\n".join(details)
     if res.get("n_truncated"):
-        msg += "\n%d differing diff(s) were truncated to the %d-byte aggregate output budget." % (
-            res["n_truncated"], res.get("maxbytes", maxbytes))
+        msg += "\n%d differing diff(s) were cut to fit the %d-byte budget; raise maxbytes (max %d) or diff fewer files." % (
+            res["n_truncated"], res.get("maxbytes", maxbytes), DIFF_BATCH_MAXBYTES)
     _recent_diff_singles.pop((server, server_b or "local"), None)
     return (msg, n_fail > 0)
 

@@ -38,6 +38,7 @@ class ToolTestCase(unittest.TestCase):
         self.f = Fixture().__enter__()
         self.addCleanup(self.f.__exit__, None, None, None)
         self.h = Harness(self.f)
+        MCP._ONCE_SHOWN.clear()
 
     def write(self, rel, data):
         path = self.f.gm / rel
@@ -255,6 +256,70 @@ class HistoryTests(ToolTestCase):
         message, error = self.h.call("tool_fetch", what="history", deployment_id="bogus")
         self.assertTrue(error)
         self.assertIn("deployment_id", message)
+
+
+class DiffAndDeployOutputTests(ToolTestCase):
+    def local_copies(self, n, differ=()):
+        """Remote data/fNN.lua plus local copies; indexes in differ get edited copies."""
+        folder = self.f.root / "local"
+        folder.mkdir(exist_ok=True)
+        files = []
+        for i in range(n):
+            body = b"line a\nline b %d\n" % i
+            self.write("data/f%02d.lua" % i, body)
+            local = folder / ("f%02d.lua" % i)
+            local.write_bytes(body.replace(b"line b", b"line B") if i in differ else body)
+            files.append({"path": "data/f%02d.lua" % i, "local": str(local)})
+        return files
+
+    def test_batch_diff_counts_identical_files_instead_of_listing_them(self):
+        files = self.local_copies(40)
+        text, error = self.h.call("tool_diff", files=files, confirm=True)
+        self.assertFalse(error, text)
+        self.assertIn("40 files, 40 identical, 0 differ, 0 failed", text)
+        self.assertIn("identical files are not listed", text)
+        self.assertEqual(len(text.split("\n")), 1)
+        again, _ = self.h.call("tool_diff", files=files, confirm=True)
+        self.assertNotIn("not listed", again)
+        self.assertLess(len(again), 120)
+
+    def test_batch_diff_prints_each_differing_file_once(self):
+        text, error = self.h.call("tool_diff", files=self.local_copies(3, differ={1}), confirm=True)
+        self.assertFalse(error, text)
+        server = MCP.SERVER_NAMES[0]
+        self.assertIn("3 files, 2 identical, 1 differ, 0 failed", text)
+        self.assertIn("[diff] %s:data/f01.lua vs local:f01.lua: DIFFER (16 vs 16 bytes)" % server, text)
+        self.assertIn("sha256_a=%s sha256_b=%s" % (sha(b"line a\nline b 1\n"), sha(b"line a\nline B 1\n")), text)
+        self.assertIn("-line b 1\n+line B 1", text)
+        for absent in ("f00.lua", "f02.lua", "--- ", "+++ ", "sha1"):
+            self.assertNotIn(absent, text)
+
+    def test_single_identical_diff_prints_one_hash(self):
+        entry = self.local_copies(1)[0]
+        text, error = self.h.call("tool_diff", path=entry["path"], local=entry["local"], confirm=True)
+        self.assertFalse(error, text)
+        self.assertIn(": IDENTICAL (16 bytes)\nsha256=%s" % sha(b"line a\nline b 0\n"), text)
+        self.assertNotIn("sha256_b", text)
+
+    def test_deploy_lists_only_files_whose_hash_changed(self):
+        self.write("data/keep", b"same")
+        self.write("data/edit", b"old")
+        files = [{"to": "data/keep", "content": "same", "expected_sha256": sha(b"same")},
+                 {"to": "data/edit", "content": "new", "expected_sha256": sha(b"old")},
+                 {"to": "lua/x.lua", "content": "return 1", "expected_sha256": "missing"}]
+        text, error = self.h.call("tool_deploy", confirm=True, files=files)
+        self.assertFalse(error, text)
+        self.assertIn("deployed 3 file(s) (1 new, 1 replaced, 1 unchanged), 11 changed bytes", text)
+        self.assertIn("\ndata/edit  %s\n" % sha(b"new"), text)
+        self.assertIn("\nlua/x.lua  %s  new" % sha(b"return 1"), text)
+        self.assertNotIn("data/keep", text)
+        for guidance in ("backup_id=<deployment_id>", "Unchanged files are not listed", "runtime reload"):
+            self.assertIn(guidance, text)
+        files = [{"to": "data/edit", "content": "newer", "expected_sha256": sha(b"new")},
+                 {"to": "lua/x.lua", "content": "return 1", "expected_sha256": sha(b"return 1")}]
+        again, error = self.h.call("tool_deploy", confirm=True, files=files)
+        self.assertFalse(error, again)
+        self.assertEqual(len(again.split("\n")), 2, again)
 
 
 if __name__ == "__main__":
