@@ -184,5 +184,78 @@ class MonitorDeltaTests(ToolTestCase):
         self.assertIn("#166 ", self.check(after=165))
 
 
+class HistoryTests(ToolTestCase):
+    def deploy(self, *entries):
+        return self.f.deploy(*entries)
+
+    def history(self, **args):
+        text, error = self.h.call("tool_fetch", what="history", **args)
+        self.assertFalse(error, text)
+        return text
+
+    def test_one_line_per_deployment_even_for_large_batches(self):
+        big = self.deploy(*[self.f.entry("addons/a/lua/f%03d.lua" % i, b"return %d" % i, "missing")
+                            for i in range(400)])
+        self.assertTrue(big["ok"], big)
+        text = self.history(lines=1)
+        lines = text.split("\n")
+        self.assertEqual(len(lines), 2, text)
+        self.assertIn(big["deployment_id"], lines[1])
+        self.assertIn("deploy complete", lines[1])
+        self.assertIn("400 file(s) (400 new)", lines[1])
+        self.assertIn("addons/a/lua/f000.lua +399", lines[1])
+        self.assertLess(len(text), 400)
+
+    def test_detail_pages_files_with_full_hashes(self):
+        big = self.deploy(*[self.f.entry("addons/a/lua/f%03d.lua" % i, b"return %d" % i, "missing")
+                            for i in range(120)])
+        text = self.history(deployment_id=big["deployment_id"])
+        self.assertIn("files 1-50 of 120", text)
+        self.assertIn("addons/a/lua/f000.lua  %s  new" % sha(b"return 0"), text)
+        self.assertIn("next: offset=51", text)
+        tail = self.history(deployment_id=big["deployment_id"], offset=101)
+        self.assertIn("files 101-120 of 120", tail)
+        self.assertNotIn("next: offset", tail)
+
+    def test_replaced_unchanged_rejected_and_uncertain_outcomes(self):
+        self.write("data/a", b"a0")
+        self.write("data/b", b"b0")
+        mixed = self.deploy(self.f.entry("data/a", b"a1", sha(b"a0")), self.f.entry("data/b", b"b0", sha(b"b0")))
+        stale = self.deploy(self.f.entry("data/a", b"a2", sha(b"a0")))
+        self.assertFalse(stale["ok"])
+        listing = self.history()
+        self.assertIn("deploy rejected  1 file(s)  data/a  1 stale-base conflict(s)", listing)
+        self.assertIn("deploy complete  2 file(s) (1 replaced, 1 unchanged)", listing)
+        detail = self.history(deployment_id=mixed["deployment_id"])
+        self.assertIn("restorable with backup_id=%s" % mixed["deployment_id"], detail)
+        self.assertIn("data/a  %s  was %s" % (sha(b"a1"), sha(b"a0")[:16]), detail)
+        self.assertIn("data/b  %s  unchanged" % sha(b"b0"), detail)
+        conflict = self.history(deployment_id=stale["deployment_id"])
+        self.assertIn("conflict data/a: expected=%s actual=%s" % (sha(b"a0"), sha(b"a1")), conflict)
+        (self.f.history / (mixed["deployment_id"] + ".result.json")).unlink()
+        self.assertIn("deploy uncertain", self.history())
+        self.assertIn("inspect live hashes before retrying", self.history())
+
+    def test_pagination_and_pre_2_1_cursor(self):
+        ids = [self.deploy(self.f.entry("data/p%d" % i, b"x", "missing"))["deployment_id"] for i in range(3)]
+        page = self.history(lines=2)
+        self.assertIn("next page: before=%s" % ids[1], page)
+        rest = self.history(before=ids[1])
+        self.assertIn(ids[0], rest)
+        self.assertNotIn(ids[1], rest)
+        self.assertNotIn("next page", rest)
+        self.assertNotIn(ids[1], self.history(before=ids[1] + ".prepared.json"))
+
+    def test_path_filter_and_bad_deployment_id(self):
+        self.deploy(self.f.entry("data/one", b"1", "missing"))
+        self.deploy(self.f.entry("lua/two.lua", b"2", "missing"))
+        text = self.history(path="lua/")
+        self.assertIn("lua/two.lua", text)
+        self.assertNotIn("data/one", text)
+        message, error = self.h.call("tool_fetch", what="history", deployment_id="bogus")
+        self.assertTrue(error)
+        self.assertIn("deployment_id", message)
+
+
 if __name__ == "__main__":
     unittest.main()

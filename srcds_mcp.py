@@ -991,36 +991,87 @@ def _restore_path(root, u, to, backup_id):
         raise ValueError("requested backup does not exist")
     return path
 
+def _history_load(history, ident):
+    """One deployment's receipts by phase (prepared, then result or rejected)."""
+    recs = {}
+    for phase in ("prepared", "result", "rejected"):
+        try:
+            with open(os.path.join(history, "%s.%s.json" % (ident, phase)), encoding="utf-8") as f:
+                recs[phase] = json.load(f)
+        except FileNotFoundError:
+            pass
+    return recs
+
+def _history_entry(ident, recs, prefix):
+    """(summary, matching file records, main receipt) with the phases merged."""
+    main = recs.get("result") or recs.get("rejected") or recs.get("prepared") or {}
+    files = [e for e in main.get("files") or [] if str(e.get("to", "")).startswith(prefix)]
+    if "result" in recs:
+        outcome = main.get("outcome") or ("complete" if main.get("ok") else "partial_or_uncertain")
+    elif "rejected" in recs:
+        outcome = "rejected"
+    else:
+        outcome = "uncertain"          # prepared without a result: interrupted
+    counts = {"new": 0, "replaced": 0, "unchanged": 0, "failed": 0}
+    changed_bytes = 0
+    for e in files if outcome != "rejected" else ():
+        if e.get("ok") is False:
+            counts["failed"] += 1
+        elif e.get("noop") or e.get("before_sha256") == e.get("after_sha256"):
+            counts["unchanged"] += 1
+        else:
+            counts["new" if e.get("before_sha256") == "missing" else "replaced"] += 1
+            changed_bytes += int(e.get("bytes") or 0)
+    summary = {"deployment_id": ident, "time_ns": main.get("time_ns"),
+               "operation": main.get("operation"), "outcome": outcome, "files": len(files),
+               "counts": counts, "bytes": changed_bytes,
+               "first": files[0].get("to") if files else None,
+               "error": str(main.get("error") or "")[:200],
+               "conflicts": len(main.get("conflicts") or [])}
+    return summary, files, main
+
 def _deployment_history(req):
+    """One summary per deployment, newest first; deployment_id pages one's files."""
     root = _guard_root(req["uuid"])
     history = os.path.join(root, "history")
     prefix = req.get("path") or ""
+    ident = req.get("deployment_id")
+    if ident:
+        ident = str(ident)
+        if not re.fullmatch(r"[0-9]{20}-[0-9a-f]{16}", ident):
+            return {"ok": False, "error": "deployment_id must be an id from the history list"}
+        recs = _history_load(history, ident)
+        if not recs:
+            return {"ok": False, "error": "no such deployment: %s" % ident}
+        summary, files, main = _history_entry(ident, recs, prefix)
+        offset = max(1, int(req.get("offset") or 1))
+        limit = max(1, min(int(req.get("lines", 50)), 200))
+        fields = ("to", "ok", "noop", "error", "expected_sha256", "before_sha256",
+                  "after_sha256", "restore_from", "source_path")
+        return {"ok": True, "summary": summary, "origin": main.get("origin") or {},
+                "conflicts": (main.get("conflicts") or [])[:20],
+                "offset": offset, "total_files": len(files),
+                "files": [{k: e[k] for k in fields if k in e}
+                          for e in files[offset - 1:offset - 1 + limit]]}
     limit = max(1, min(int(req.get("lines", 20)), 100))
-    before = req.get("before") or "~"
-    records = []
+    # Cursors are deployment ids; clients before 2.1 sent a receipt file name.
+    before = str(req.get("before") or "~").split(".", 1)[0]
     try:
-        names = sorted(os.listdir(history), reverse=True)
+        names = os.listdir(history)
     except FileNotFoundError:
         names = []
-    used = 0
-    cursor = None
-    for name in names:
-        if not name.endswith(".json") or name >= before:
-            continue
-        with open(os.path.join(history, name), encoding="utf-8") as f:
-            record = json.load(f)
-        if prefix:
-            record["files"] = [e for e in record.get("files", []) if e.get("to", "").startswith(prefix)]
-            if not record["files"]:
-                continue
-        size = len(json.dumps(record))
-        if records and (len(records) >= limit or used + size > 180000):
+    idents = sorted({n.split(".", 1)[0] for n in names if n.endswith(".json")}, reverse=True)
+    out, cursor = [], None
+    for scanned, ident in enumerate(i for i in idents if i < before):
+        if len(out) >= limit or scanned >= 2000:
             break
-        records.append(record)
-        used += size
-        cursor = name
-    return {"ok": True, "history": records, "before": cursor,
-            "note": "prepared without a result means interrupted or uncertain; inspect live hashes before retrying"}
+        cursor = ident
+        summary, files, _ = _history_entry(ident, _history_load(history, ident), prefix)
+        if files or not prefix:
+            out.append(summary)
+    else:
+        cursor = None                  # nothing older remains
+    return {"ok": True, "history": out, "before": cursor}
 
 def op_deploy(req):
     import hashlib, uuid
@@ -2689,6 +2740,80 @@ def _fmt_mtime(ts):
         return "?"
 
 
+def _fmt_time_ns(ns):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ns) / 1e9))
+    except Exception:
+        return "?"
+
+
+def _history_line(s):
+    counts = ", ".join("%d %s" % (n, k) for k, n in (s.get("counts") or {}).items() if n)
+    parts = [s.get("deployment_id"), _fmt_time_ns(s.get("time_ns")),
+             "%s %s" % (s.get("operation") or "deploy", s.get("outcome")),
+             "%d file(s)%s" % (s.get("files", 0), (" (%s)" % counts) if counts else "")]
+    if s.get("bytes"):
+        parts.append("%d B" % s["bytes"])
+    if s.get("first"):
+        parts.append(s["first"] + (" +%d" % (s["files"] - 1) if s.get("files", 0) > 1 else ""))
+    if s.get("conflicts"):
+        parts.append("%d stale-base conflict(s)" % s["conflicts"])
+    if s.get("error"):
+        parts.append(s["error"][:120])
+    return "  ".join(parts)
+
+
+def _history_file_line(e, outcome):
+    src = e.get("source_path") or ""
+    src = "  src=%s" % src if src and src != "inline" and not src.startswith("backup:") else ""
+    if outcome == "rejected":
+        return "%s  expected %s%s" % (e.get("to"), str(e.get("expected_sha256"))[:16], src)
+    if e.get("ok") is False:
+        return "%s  FAILED: %s" % (e.get("to"), str(e.get("error") or "")[:200])
+    before, after = e.get("before_sha256"), e.get("after_sha256") or "?"
+    if e.get("noop") or before == after:
+        state = "unchanged"
+    elif before == "missing":
+        state = "new"
+    else:
+        state = "was %s" % str(before)[:16]
+    if e.get("restore_from"):
+        state += ", restored from %s" % e["restore_from"]
+    return "%s  %s  %s%s" % (e.get("to"), after, state, src)
+
+
+def _format_history(server, res):
+    """Deployment history: one line per deployment, or one deployment's files."""
+    if "summary" in res:
+        s = res["summary"]
+        out = ["[%s] deployment %s" % (server.upper(), _history_line(s))]
+        origin = " ".join("%s=%s" % (k, v) for k, v in sorted((res.get("origin") or {}).items()) if v)
+        if origin:
+            out.append("origin: " + origin)
+        for c in res.get("conflicts") or []:
+            out.append("conflict %s: expected=%s actual=%s" % (
+                c.get("to"), c.get("expected_sha256"), c.get("actual_sha256")))
+        if (s.get("counts") or {}).get("replaced"):
+            out.append("replaced files are restorable with backup_id=%s" % s["deployment_id"])
+        files, first = res.get("files") or [], res.get("offset", 1)
+        total = res.get("total_files", len(files))
+        if files:
+            out.append("files %d-%d of %d (path  sha256 after  state):" % (first, first + len(files) - 1, total))
+            out += [_history_file_line(e, s.get("outcome")) for e in files]
+            if first + len(files) - 1 < total:
+                out.append("next: offset=%d" % (first + len(files)))
+        return "\n".join(out)
+    items = res.get("history") or []
+    out = ["[%s] deployment history, newest first: %d shown%s" % (
+        server.upper(), len(items), "; per-file detail: deployment_id=<id>" if items else "")]
+    out += [_history_line(s) for s in items]
+    if res.get("before"):
+        out.append("next page: before=%s" % res["before"])
+    if any(s.get("outcome") in ("uncertain", "partial_or_uncertain") for s in items):
+        out.append("uncertain/partial deployments may have changed files: inspect live hashes before retrying.")
+    return "\n".join(out)
+
+
 def tool_fetch(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
@@ -2710,7 +2835,9 @@ def tool_fetch(args):
     if what in ("dir", "hash", "backups", "history"):
         req = {"op": "fetch", "uuid": srv["uuid"], "what": what, "path": args.get("path", "")}
         if what == "history":
-            req.update(lines=args.get("lines", 20), before=args.get("before"))
+            detail = args.get("deployment_id")
+            req.update(lines=args.get("lines", 50 if detail else 20), before=args.get("before"),
+                       deployment_id=detail, offset=args.get("offset", 1))
         if what == "hash" and args.get("glob"):
             req["glob"] = args["glob"]
         res = run_driver(req, timeout=90)
@@ -2718,7 +2845,7 @@ def tool_fetch(args):
         if not res.get("ok"):
             return ("fetch failed: %s" % res.get("error"), True)
         if what == "history":
-            return (json.dumps(res, ensure_ascii=False, indent=2), False)
+            return (_format_history(server, res), False)
         if what == "dir":
             ents = res.get("entries", [])
             out = ["[%s] dir garrysmod/%s — %d entries%s" % (
@@ -4129,8 +4256,8 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups", "docker"], "default": "console"},
-                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (max 2000). file: lines, or grep matches, per read (max 5000)."},
-                "offset": {"type": "integer", "default": 1, "description": "file: 1-based first line to return (with grep, the first line searched). Negative starts that many lines before the end: -50 reads the last 50 lines. The reply names the next offset when more remain."},
+                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (max 2000). file: lines, or grep matches, per read (max 5000). history: deployments per page (default 20, max 100), or files per page with deployment_id (default 50, max 200)."},
+                "offset": {"type": "integer", "default": 1, "description": "file: 1-based first line to return (with grep, the first line searched). Negative starts that many lines before the end: -50 reads the last 50 lines. The reply names the next offset when more remain. history with deployment_id: 1-based first file."},
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
                 "grep": {"type": "string", "description": "Optional substring filter. file: searches the whole file and returns numbered matching lines; console/docker: filters the tailed lines."},
@@ -4421,9 +4548,11 @@ for _schema_tool in TOOLS:
             {"required": ["to", "expected_sha256"], "not": {"required": ["files"]}}]
     elif _schema_tool["name"] == "srcds_fetch":
         _props["what"]["enum"].append("history")
-        _props["before"] = {"type": "string", "description": "For history: opaque 'before' cursor returned by the previous page."}
+        _props["before"] = {"type": "string", "description": "For history: the 'before' cursor printed by the previous page."}
+        _props["deployment_id"] = {"type": "string", "pattern": "^[0-9]{20}-[0-9a-f]{16}$",
+                                   "description": "For history: list this deployment's files with full hashes (page with offset/lines)."}
         _props["path"]["description"] += " For history/backups: optional relative path prefix filter."
-        _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' returns durable per-file deployment metadata (lines=page size, max 100; before=cursor). Backups list explicit backup_id values."
+        _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' lists deployments newest first, one line each (lines=page size, max 100; before=cursor); deployment_id shows one deployment's files. Backups list explicit backup_id values."
 
 DISPATCH = {
     "srcds_status": tool_status,
