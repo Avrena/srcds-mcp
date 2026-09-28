@@ -363,7 +363,7 @@ class ClientGuardTests(unittest.TestCase):
                 entry = sent["files"][0] if "files" in sent else sent
                 self.assertEqual(entry["expected_sha256"], "missing")
                 self.assertEqual(sent["server"], request["server"])
-                self.assertEqual(sent["origin"]["tool_version"], "2.0.0")
+                self.assertEqual(sent["origin"]["tool_version"], MCP.MCP_VERSION)
                 self.assertEqual(base64.b64decode(entry["content_b64"]), b"new")
 
     def test_unsafe_or_ambiguous_client_inputs_do_not_deploy(self):

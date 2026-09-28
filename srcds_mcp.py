@@ -24,7 +24,7 @@ and rotate beside the selected config file.
 import sys, os, json, base64, subprocess, socket, struct, re, time, traceback, hashlib
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-MCP_VERSION = "2.0.0"
+MCP_VERSION = "2.1.0"
 import uuid as _uuid
 _CLIENT_INSTANCE = _uuid.uuid4().hex
 MCP_PROTOCOL_VERSION = "2025-11-25"
