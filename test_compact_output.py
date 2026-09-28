@@ -322,5 +322,74 @@ class DiffAndDeployOutputTests(ToolTestCase):
         self.assertEqual(len(again.split("\n")), 2, again)
 
 
+class GrepOutputTests(ToolTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write("addons/a/lua/sv_net.lua", "".join(
+            '    net.Receive("msg_%03d", function(len, ply) end)\n' % i for i in range(200)))
+        self.write("addons/a/lua/cl_hud.lua", "local x = 1\n\tHUD_HOOK()\nlocal y = 2\nlocal z = 3\nhud_hook()\n")
+        self.write("addons/a/lua/dots.lua", "a.b\naxb\n")
+        self.write("addons/a/lua/sub/x-1:odd.lua", "Foo|Bar\n")
+
+    def grep(self, **args):
+        text, error = self.h.call("tool_grep", **args)
+        self.assertFalse(error, text)
+        return text
+
+    def test_matches_are_grouped_by_file_with_indentation_stripped(self):
+        lines = self.grep(pattern="net.Receive", max=200).split("\n")
+        self.assertIn("grep: 200 match(es) in 1 file(s)", lines[0])
+        self.assertEqual(lines[1], "addons/a/lua/sv_net.lua")
+        self.assertEqual(lines[2], '1:net.Receive("msg_000", function(len, ply) end)')
+        self.assertEqual(len(lines), 202)
+        self.assertLess(sum(len(line) + 1 for line in lines), 12500)
+
+    def test_max_caps_shown_matches_but_counts_all(self):
+        text = self.grep(pattern="net.Receive", max=5)
+        self.assertIn("grep: 200 match(es), showing 5 in 1 file(s)", text)
+        self.assertEqual(len(text.split("\n")), 7)
+
+    def test_single_file_and_names_with_colons_and_dashes(self):
+        self.assertEqual(self.grep(pattern="hud_hook", path="addons/a/lua/cl_hud.lua").split("\n")[1:],
+                         ["addons/a/lua/cl_hud.lua", "5:hud_hook()"])
+        self.assertEqual(self.grep(pattern="Foo", path="addons/a/lua/sub").split("\n")[1:],
+                         ["addons/a/lua/sub/x-1:odd.lua", "1:Foo|Bar"])
+
+    def test_ignore_case_and_regex_syntaxes(self):
+        self.assertTrue(self.grep(pattern="hud_hook", ignore_case=True).endswith("2:HUD_HOOK()\n5:hud_hook()"))
+        self.assertIn("grep: 0 match(es)", self.grep(pattern="HUD_HOOK|hud_hook"))
+        self.assertIn("2 match(es)", self.grep(pattern="HUD_HOOK|hud_hook", regex="extended"))
+        self.assertIn("2 match(es)", self.grep(pattern="a.b", path="addons/a/lua/dots.lua"))
+        self.assertIn("1 match(es)", self.grep(pattern="a.b", path="addons/a/lua/dots.lua", regex="fixed"))
+        self.assertIn("200 match(es)", self.grep(pattern=r'msg_\d{3}"', regex="perl", max=1))
+
+    def test_context_lines_separators_and_cap(self):
+        self.write("lua/ctx.lua", "a\nhit1\nb\nc\nd\ne\nhit2\nz\n")
+        self.assertEqual(self.grep(pattern="hit", path="lua", context=1).split("\n")[1:],
+                         ["lua/ctx.lua", "1-a", "2:hit1", "3-b", "--", "6-e", "7:hit2", "8-z"])
+        capped = self.grep(pattern="hit", path="lua", context=1, max=1).split("\n")
+        self.assertIn("grep: 2 match(es), showing 1 in 1 file(s)", capped[0])
+        self.assertEqual(capped[1:], ["lua/ctx.lua", "1-a", "2:hit1", "3-b"])
+
+    def test_files_output_lists_names_only(self):
+        self.assertEqual(self.grep(pattern="local", output="files").split("\n")[1:],
+                         ["addons/a/lua/cl_hud.lua"])
+        self.assertIn("1 matching file(s)", self.grep(pattern="local", output="files"))
+
+    def test_capture_cap_keeps_whole_records_and_marks_the_total(self):
+        self.write("lua/rows.lua", "".join("row %04d %s\n" % (i, "x" * 40) for i in range(3000)))
+        lines = self.grep(pattern="row", path="lua", max=2000).split("\n")
+        self.assertIn("grep: >=", lines[0])
+        self.assertRegex(lines[-1], r"^\d+:row \d{4} x{40}$")
+
+    def test_bad_options_fail_before_transport(self):
+        for bad in ({"regex": "glob"}, {"output": "count"}, {"context": "two"}):
+            with mock.patch.object(MCP, "run_driver") as run, \
+                 mock.patch.object(MCP, "resolve", return_value=self.h.srv):
+                text, error = MCP.tool_grep(dict(server=MCP.SERVER_NAMES[0], pattern="x", **bad))
+            self.assertTrue(error, bad)
+            run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

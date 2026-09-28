@@ -1220,8 +1220,22 @@ def op_grep(req):
         if not os.path.exists(base):
             return {"ok": False, "error": "no such path: %s" % rel}
         bases.append(base)
-    mx = max(1, min(int(req.get("max", 200)), 2000))
-    cmd = ["grep", "-rnI"]
+    mode = req.get("output") or "lines"
+    flag = {"basic": "-G", "extended": "-E", "fixed": "-F", "perl": "-P"}.get(req.get("regex") or "basic")
+    if mode not in ("lines", "files") or flag is None:
+        return {"ok": False, "error": "output must be lines|files and regex basic|extended|fixed|perl"}
+    try:
+        mx = max(1, min(int(req.get("max", 200)), 2000))
+        ctx = max(0, min(int(req.get("context", 0)), 10)) if mode == "lines" else 0
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "max and context must be integers"}
+    # -H names the file even for a single file operand; -Z ends the name with NUL,
+    # so names or text containing ':' or '-' parse unambiguously.
+    cmd = ["grep", "-rIHZ", flag, "-l" if mode == "files" else "-n"]
+    if req.get("ignore_case"):
+        cmd.append("-i")
+    if ctx:
+        cmd += ["-C", str(ctx)]
     for glob in globs:
         cmd += ["--include", glob]
     for glob in exclude_globs:
@@ -1247,9 +1261,12 @@ def op_grep(req):
             g.wait(timeout=3)
         except subprocess.TimeoutExpired:
             g.kill(); g.wait()
-        err = g.stderr.read().decode("utf-8", "replace")[-500:]
+        with g.stderr:
+            err = g.stderr.read().decode("utf-8", "replace")[-500:]
         if not byte_capped and g.returncode not in (0, 1):
             return {"ok": False, "error": "grep rc=%s: %s" % (g.returncode, err)}
+        if byte_capped:                    # drop the record the cap cut in half
+            raw = raw[:raw.rfind(b"\0" if mode == "files" else b"\n") + 1]
         out = raw.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         for p in (h, g):
@@ -1261,26 +1278,58 @@ def op_grep(req):
             if p is not None and p.poll() is None:
                 p.kill()
         return {"ok": False, "error": "grep failed: %s" % e}
-    lines = out.splitlines()
-    total = len(lines)
     pref = os.path.realpath(gm) + os.sep
-    # Cap each line (a match inside a minified/packed line would otherwise return
-    # the WHOLE line) and the total payload, so one grep can't flood the client.
-    shown, used, capped = [], 0, False
-    for l in lines[:mx]:
-        l = l.replace(pref, "")
-        if len(l) > 300:
-            l = l[:300] + "...<+%d chars>" % (len(l) - 300)
-        if used + len(l) + 1 > 40000:
+    def rel(path):
+        return path[len(pref):] if path.startswith(pref) else path
+    if mode == "files":
+        names = [rel(n) for n in out.split("\0") if n]
+        shown, used = [], 0
+        for name in names[:mx]:
+            if used + len(name) + 1 > 40000:
+                break
+            used += len(name) + 1
+            shown.append(name)
+        return {"ok": True, "output": "files", "paths": shown, "total": len(names),
+                "shown": len(shown), "total_exact": not byte_capped,
+                "truncated": byte_capped or len(shown) < len(names)}
+    # Group by file: the path once, then [line, ':' match or '-' context, text].
+    # Each text is stripped and capped (a match inside a minified line would
+    # otherwise return the whole line), and the payload is budgeted.
+    groups, index = [], {}
+    total = shown = used = 0
+    capped = False
+    last = None                           # (file, line) of the last shown match
+    for record in out.split("\n"):
+        name, nul, rest = record.partition("\0")
+        m = re.match(r"(\d+)([:-])(.*)", rest, re.S) if nul else None
+        if not m:
+            continue                      # blank, or a '--' context-group separator
+        n, is_match = int(m.group(1)), m.group(2) == ":"
+        name = rel(name)
+        total += is_match
+        if capped or (shown >= mx and (is_match or not last or last[0] != name
+                                       or not 0 < n - last[1] <= ctx)):
+            continue                      # past the cap; keep counting matches
+        text = m.group(3).strip()
+        if len(text) > 300:
+            text = text[:300] + "...<+%d chars>" % (len(text) - 300)
+        cost = len(text) + 8 + (0 if name in index else len(name) + 1)
+        if used + cost > 40000:
             capped = True
-            break
-        used += len(l) + 1
-        shown.append(l)
-    capped = capped or byte_capped or total > mx
-    r = {"ok": True, "matches": shown, "total": total, "shown": len(shown),
-         "total_exact": not byte_capped, "truncated": capped}
-    if capped:
-        r["note"] = "capture-capped; narrow paths/globs/patterns for a complete result"
+            continue
+        used += cost
+        if name not in index:
+            index[name] = len(groups)
+            groups.append([name, []])
+        groups[index[name]][1].append([n, m.group(2), text])
+        if is_match:
+            shown += 1
+            last = (name, n)
+    truncated = capped or byte_capped or total > shown
+    r = {"ok": True, "output": "lines", "groups": groups, "total": total, "shown": shown,
+         "total_exact": not byte_capped, "truncated": truncated}
+    if truncated:
+        r["note"] = "capture-capped; narrow paths/globs/patterns or raise max"
     return r
 
 def _diff_one(req, diff_cap=40000, batch=False):
@@ -3210,25 +3259,58 @@ def tool_grep(args):
         paths = [""]
     if any(not isinstance(p, str) for p in paths) or len(paths) > GREP_MAX_PATHS:
         return ("invalid paths[] (max %d string roots)." % GREP_MAX_PATHS, True)
+    output = args.get("output") or "lines"
+    regex = args.get("regex") or "basic"
+    if output not in ("lines", "files"):
+        return ("output must be 'lines' or 'files'.", True)
+    if regex not in ("basic", "extended", "fixed", "perl"):
+        return ("regex must be basic, extended, fixed or perl.", True)
+    try:
+        context = max(0, min(int(args.get("context", 0)), 10))
+        mx = int(args.get("max", 200))
+    except (TypeError, ValueError):
+        return ("context and max must be integers.", True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     res = run_driver({"op": "grep", "uuid": srv["uuid"], "patterns": patterns,
                       "paths": paths, "globs": globs, "exclude_globs": exclude_globs,
-                      "max": int(args.get("max", 200))}, timeout=40)
+                      "max": mx, "output": output, "regex": regex, "context": context,
+                      "ignore_case": bool(args.get("ignore_case"))}, timeout=40)
     log_event({"ev": "grep", "server": server, "pattern": "\n".join(patterns),
                "paths": len(paths), "globs": len(globs), "ok": res.get("ok")})
     if not res.get("ok"):
         return ("grep failed: %s" % res.get("error"), True)
+    return (_format_grep(server, res, context), False)
+
+
+def _format_grep(server, res, context):
+    """Matches grouped by file: the path once, then N:text (N-text for context)."""
     total, shown = res.get("total", 0), res.get("shown", 0)
     total_text = str(total) if res.get("total_exact", True) else (">=%d" % total)
-    head = "[%s] grep — %s captured match(es), %d pattern(s), %d include glob(s), %d root(s)%s" % (
-        server.upper(), total_text, len(patterns), len(globs), len(paths),
-        ("" if total <= shown and not res.get("truncated") else " (showing %d)" % shown))
+    if res.get("output") == "files":
+        paths = res.get("paths") or []
+        head = "[%s] grep: %s matching file(s)" % (server.upper(), total_text)
+        if res.get("truncated"):
+            head += ", showing %d (narrow the search or raise max)" % len(paths)
+        return head + "".join("\n" + p for p in paths)
+    groups = res.get("groups") or []
+    head = "[%s] grep: %s match(es)" % (server.upper(), total_text)
+    if groups:
+        head += ", showing %d in %d file(s)" % (shown, len(groups)) if res.get("truncated") \
+            else " in %d file(s)" % len(groups)
     if res.get("note"):
         head += "  [%s]" % res["note"]
-    matches = res.get("matches", [])
-    return (head + ("\n" + "\n".join(matches) if matches else ""), False)
+    out = [head]
+    for name, rows in groups:
+        out.append(name)
+        prev = None
+        for n, sep, text in rows:
+            if context and prev is not None and n != prev + 1:
+                out.append("--")
+            out.append("%d%s%s" % (n, sep, text))
+            prev = n
+    return "\n".join(out)
 
 
 def _format_diff_result(req, res):
@@ -4349,14 +4431,14 @@ TOOLS = [
     },
     {
         "name": "srcds_grep",
-        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Singular fields remain compatible. Read-only, always allowed.",
+        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Matches are grouped by file: the path once, then N:text with indentation stripped (N-text for context lines). output='files' lists matching files only. Read-only, always allowed.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "pattern": {"type": "string", "description": "grep -e pattern (basic regex)."},
+                "pattern": {"type": "string", "description": "grep -e pattern, in the syntax set by regex (default basic)."},
                 "patterns": {"type": "array", "minItems": 1, "maxItems": 20,
-                             "items": {"type": "string"}, "description": "Multiple grep -e basic regexes; matches ANY pattern."},
+                             "items": {"type": "string"}, "description": "Multiple grep -e patterns; matches ANY pattern."},
                 "path": {"type": "string", "description": "Subdir under garrysmod/ to search (default whole volume), e.g. 'addons/rals'."},
                 "paths": {"type": "array", "minItems": 1, "maxItems": 25,
                           "items": {"type": "string"}, "description": "Search several garrysmod-relative roots in the same call."},
@@ -4365,7 +4447,13 @@ TOOLS = [
                           "items": {"type": "string"}, "description": "Multiple filename include globs (OR)."},
                 "exclude_globs": {"type": "array", "maxItems": 50,
                                   "items": {"type": "string"}, "description": "Filename globs to exclude."},
-                "max": {"type": "integer", "default": 200, "description": "Max matches to return."},
+                "max": {"type": "integer", "default": 200, "description": "Max matches (or files with output='files') to return; the total is still counted."},
+                "regex": {"type": "string", "enum": ["basic", "extended", "fixed", "perl"], "default": "basic",
+                          "description": "Pattern syntax: basic (grep -G), extended (-E: a|b, +, ?, {n}), fixed strings (-F), or perl (-P: \\d, \\b, lookaround)."},
+                "ignore_case": {"type": "boolean", "default": False, "description": "Case-insensitive matching (grep -i)."},
+                "context": {"type": "integer", "default": 0, "description": "Lines of context around each match (0-10), shown as N-text."},
+                "output": {"type": "string", "enum": ["lines", "files"], "default": "lines",
+                           "description": "lines: grouped matches. files: only the names of matching files (grep -l)."},
             },
             "required": ["server"],
             "anyOf": [{"required": ["pattern"]}, {"required": ["patterns"]}],
