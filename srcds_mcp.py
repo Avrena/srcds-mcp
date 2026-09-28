@@ -45,7 +45,13 @@ DEPLOY_BATCH_MAX_INPUT_BYTES = 256 * 1024 * 1024
 GREP_MAX_PATTERNS = 20
 GREP_MAX_GLOBS = 50
 GREP_MAX_PATHS = 25
+# Default output budgets are sized for agents that call tools many times per
+# session; callers can still ask for up to OUTPUT_MAX_BYTES.
+CONSOLE_DEFAULT_MAXBYTES = 8000
 FETCH_DEFAULT_MAXBYTES = 12000
+GREP_DEFAULT_MAX = 50
+DB_DEFAULT_MAXBYTES = 12000
+OUTPUT_MAX_BYTES = 200000
 FILE_LINE_MAX_CHARS = 2000
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_KEEP = 3
@@ -374,7 +380,7 @@ def op_console(req):
     # bytes), then byte-cap what the client actually has to read. Keep the
     # most-recent (end) slice, same policy as op_fetch.
     out = _ANSI_RE.sub("", out)
-    maxb = max(1, min(int(req.get("maxbytes", 24000)), 200000))
+    maxb = max(1, min(int(req.get("maxbytes", 8000)), 200000))
     orig = len(out)
     truncated = orig > maxb
     if truncated:
@@ -629,7 +635,7 @@ def op_fetch(req):
         if pat:
             out = "\n".join(l for l in out.splitlines() if pat in l)
         out = _ANSI_RE.sub("", out)
-        maxb = max(1, min(int(req.get("maxbytes", 48000)), 200000))
+        maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
         orig = len(out)
         truncated = orig > maxb
         if truncated:
@@ -690,7 +696,7 @@ def op_fetch(req):
     # window holds <= `lines` newlines (long / minified / JSON lines, or a run of
     # long log lines) the whole block comes back (tens of KB) instead of ~N short
     # lines -> the occasional over-return. Keep the most-recent (end) slice.
-    maxb = max(1, min(int(req.get("maxbytes", 48000)), 200000))
+    maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
     orig = len(tail)
     truncated = orig > maxb
     if truncated:
@@ -1225,7 +1231,7 @@ def op_grep(req):
     if mode not in ("lines", "files") or flag is None:
         return {"ok": False, "error": "output must be lines|files and regex basic|extended|fixed|perl"}
     try:
-        mx = max(1, min(int(req.get("max", 200)), 2000))
+        mx = max(1, min(int(req.get("max", 50)), 2000))
         ctx = max(0, min(int(req.get("context", 0)), 10)) if mode == "lines" else 0
     except (TypeError, ValueError):
         return {"ok": False, "error": "max and context must be integers"}
@@ -1408,7 +1414,7 @@ def op_diff(req):
     if len(files) > 200:
         return {"ok": False, "error": "batch has %d files (max 200)" % len(files)}
     try:
-        maxbytes = max(0, min(int(req.get("maxbytes", 48000)), 200000))
+        maxbytes = max(0, min(int(req.get("maxbytes", 16000)), 200000))
     except (TypeError, ValueError):
         return {"ok": False, "error": "maxbytes must be an integer"}
     # Preflight every side before reading/diffing so a 200-file request cannot turn
@@ -1960,7 +1966,7 @@ def op_db(req):
         return {"ok": False, "error": "db exec failed: %s" % e}
     out = r.stdout.decode("utf-8", "replace")
     err = r.stderr.decode("utf-8", "replace")
-    maxb = int(req.get("maxbytes", 40000))
+    maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
     truncated = len(out) > maxb
     if truncated:
         out = out[:maxb]
@@ -2008,7 +2014,7 @@ def op_mongo(req):
         return {"ok": False, "error": "mongo exec failed: %s" % e}
     out = r.stdout.decode("utf-8", "replace")
     err = r.stderr.decode("utf-8", "replace")
-    maxb = int(req.get("maxbytes", 40000))
+    maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
     truncated = len(out) > maxb
     if truncated:
         out = out[:maxb]
@@ -2420,7 +2426,7 @@ def tool_console(args):
             return (blocked, True)
     res = run_driver({"op": "console", "uuid": srv["uuid"], "cmd": command,
                       "grep": args.get("grep"),
-                      "maxbytes": int(args.get("maxbytes", 24000))}, timeout=45)
+                      "maxbytes": int(args.get("maxbytes", CONSOLE_DEFAULT_MAXBYTES))}, timeout=45)
     log_event({"ev": "console", "server": server, "cmd": command,
                "confirm": bool(args.get("confirm")), "ok": res.get("ok")})
     if not res.get("ok"):
@@ -2431,7 +2437,7 @@ def tool_console(args):
     if res.get("truncated"):
         head += "  [byte-capped -> most recent; raise maxbytes or narrow with grep]"
     if note:
-        head += "\n(note: %s)" % note
+        head += _once("console-note:" + server, "\n(note: %s)" % note)
     src = "console.log delta" if res.get("condebug") else "pty capture"
     return (head + "\n--- %s ---\n" % src + out, False)
 
@@ -2902,9 +2908,9 @@ def tool_fetch(args):
                 " (showing first 500)" if res.get("truncated") else "")]
             for e in ents:
                 if e.get("dir"):
-                    out.append("  %-44s     <dir>" % (e["name"] + "/"))
+                    out.append(e["name"] + "/")
                 else:
-                    out.append("  %-44s %9s  %s" % (e["name"], e.get("size"), _fmt_mtime(e.get("mtime"))))
+                    out.append("%s  %s  %s" % (e["name"], e.get("size"), _fmt_mtime(e.get("mtime"))))
             return ("\n".join(out), False)
         if what == "hash":
             files = res.get("files", {})
@@ -2916,7 +2922,7 @@ def tool_fetch(args):
             used, omitted = 0, 0
             for rel in sorted(files):
                 h, sz = files[rel]
-                line = "  %s %9s  %s" % (h or "?" * 12, sz, rel)
+                line = "%s %s %s" % (h or "?", sz, rel)
                 if used + len(line) > 48000:
                     omitted += 1
                     continue
@@ -2928,21 +2934,22 @@ def tool_fetch(args):
             if res.get("skipped_escaped"):
                 out.append("  [%d symlink target(s) escaped garrysmod/ and were not read]" %
                            res["skipped_escaped"])
-            out.append("TIP: when several hashes differ, compare them in ONE srcds_diff files=[...] batch, not separate calls.")
+            tip = _once("hash-tip", "TIP: when several hashes differ, compare them in ONE srcds_diff files=[...] batch, not separate calls.")
+            if tip:
+                out.append(tip)
             return ("\n".join(out), False)
         baks = res.get("backups", [])
         out = ["[%s] deploy backups (restore requires expected_sha256 and explicit backup_id) — %d%s" % (
             server.upper(), len(baks), " (capped at 500)" if res.get("truncated") else "")]
         for b in baks:
-            out.append("  %s  %s  %9s  %s" % (b.get("backup_id", "legacy"), b["path"], b["size"], _fmt_mtime(b["mtime"])))
+            out.append("%s  %s  %s  %s" % (b.get("backup_id", "legacy"), b["path"], b["size"], _fmt_mtime(b["mtime"])))
         return ("\n".join(out), False)
 
     if what == "file" and not save_to:
         return _fetch_file_text(server, srv, args)
     req = {"op": "fetch", "uuid": srv["uuid"], "what": what,
            "lines": int(args.get("lines", 200))}
-    if args.get("maxbytes") is not None:
-        req["maxbytes"] = int(args["maxbytes"])
+    req["maxbytes"] = int(args.get("maxbytes", FETCH_DEFAULT_MAXBYTES))
     if what == "file":
         req["path"] = args.get("path", "")
         req["b64"] = True
@@ -3036,7 +3043,7 @@ PANEL_URL = CFG.get("panel_url") or ""
 
 DEPLOY_BATCH_MAX = 400          # sanity cap; a whole addon fits comfortably
 DIFF_BATCH_MAX = 200
-DIFF_BATCH_DEFAULT_MAXBYTES = 48000
+DIFF_BATCH_DEFAULT_MAXBYTES = 16000
 DIFF_BATCH_MAXBYTES = 200000
 
 # Anti-trickle nudge: an LLM that uploads N files as N single-file calls burns a
@@ -3267,7 +3274,7 @@ def tool_grep(args):
         return ("regex must be basic, extended, fixed or perl.", True)
     try:
         context = max(0, min(int(args.get("context", 0)), 10))
-        mx = int(args.get("max", 200))
+        mx = int(args.get("max", GREP_DEFAULT_MAX))
     except (TypeError, ValueError):
         return ("context and max must be integers.", True)
     srv = resolve(server)
@@ -3826,7 +3833,8 @@ def tool_clientlua(args):
     if nfail:
         lines.append("Client-reported synchronous execution failed or timed out; no visual/player acceptance is implied.")
     else:
-        lines.append("All targeted clients acknowledged synchronous execution; visual/player acceptance remains separate.")
+        lines.append(_once("clientlua-accept", "All targeted clients acknowledged synchronous execution; "
+                                               "visual/player acceptance remains separate.") or "All targeted clients acknowledged.")
     return ("\n".join(lines), nfail > 0)
 
 
@@ -4015,6 +4023,14 @@ DB_ALIAS = CFG.get("db_aliases") or {}
 DB_READ_FIRST = {"select", "show", "describe", "desc", "explain", "use", "help", "checksum"}
 
 
+def _maxbytes(args, default):
+    """The caller's output budget clamped to 1..OUTPUT_MAX_BYTES, or None if not an integer."""
+    try:
+        return max(1, min(int(args.get("maxbytes", default)), OUTPUT_MAX_BYTES))
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_db(database):
     if not database:
         return None
@@ -4064,8 +4080,11 @@ def tool_db_query(args):
         return ("BLOCKED: this SQL is a WRITE/DDL (%s) against the LIVE game DB '%s' — it changes real "
                 "player/server data. Re-call with confirm=true to run it. Nothing was executed."
                 % (reason, database or "?"), True)
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
     res = run_driver({"op": "db", "sql": sql, "database": database,
-                      "format": args.get("format", "tsv"),
+                      "format": args.get("format", "tsv"), "maxbytes": maxb,
                       "read_only": reason is None}, timeout=60)
     log_event({"ev": "db_query", "database": database, "write": bool(reason),
                "confirm": bool(args.get("confirm")), "sql": sql[:200], "ok": res.get("ok")})
@@ -4075,7 +4094,7 @@ def tool_db_query(args):
     if res.get("error_out"):
         out += "\n[mysql] " + res["error_out"]
     if res.get("truncated"):
-        out += "\n... (output truncated — add a LIMIT or narrow the query)"
+        out += "\n... (output truncated: add a LIMIT, narrow the query, or raise maxbytes)"
     return ("[db:%s]\n%s" % (database or "(server default)", out), False)
 
 
@@ -4095,13 +4114,19 @@ def tool_db_schema(args):
         if not _db_name_ok(table):
             return ("invalid table name", True)
         sql = "DESCRIBE `%s`.`%s`; SHOW INDEX FROM `%s`.`%s`;" % (database, table, database, table)
-    res = run_driver({"op": "db", "sql": sql, "format": fmt,
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
+    res = run_driver({"op": "db", "sql": sql, "format": fmt, "maxbytes": maxb,
                       "read_only": True}, timeout=30)
     log_event({"ev": "db_schema", "database": database, "table": table, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("db schema failed: %s" % (res.get("error_out") or res.get("error")), True)
     what = ("databases" if not database else ("tables in %s" % database if not table else "%s.%s" % (database, table)))
-    return ("[db schema: %s]\n%s" % (what, res.get("output", "") or "(empty)"), False)
+    out = res.get("output", "") or "(empty)"
+    if res.get("truncated"):
+        out += "\n... (output truncated: raise maxbytes)"
+    return ("[db schema: %s]\n%s" % (what, out), False)
 
 
 # ----------------------------------------------------------------------------
@@ -4202,9 +4227,9 @@ def _mongo_db_ok(d):
     return bool(d) and all(c.isalnum() or c in "_-" for c in d)
 
 
-def _run_mongo(script, database=None, fmt="shell", timeout=75):
+def _run_mongo(script, database=None, fmt="shell", timeout=75, maxbytes=DB_DEFAULT_MAXBYTES):
     return run_driver({"op": "mongo", "script": script, "database": database,
-                       "format": fmt, "container": MONGO_CFG.get("container") or "",
+                       "format": fmt, "maxbytes": maxbytes, "container": MONGO_CFG.get("container") or "",
                        "auth_db": MONGO_CFG.get("auth_db") or "admin"}, timeout=timeout)
 
 
@@ -4214,7 +4239,7 @@ def _mongo_body(res):
     if res.get("error_out"):
         out += ("\n" if out else "") + "[mongosh] " + res["error_out"]
     if res.get("truncated"):
-        out += "\n... (output truncated — add .limit()/a projection, or narrow the query)"
+        out += "\n... (output truncated: add .limit() or a projection, narrow the query, or raise maxbytes)"
     return out
 
 
@@ -4243,7 +4268,10 @@ def tool_mongo_query(args):
         return ("BLOCKED: %s against the LIVE game Mongo DB '%s'. Arbitrary mongosh scripts require "
                 "confirm=true; use srcds_mongo_schema for unconfirmed structured inspection. Nothing was executed."
                 % (gate_reason, database or "?"), True)
-    res = _run_mongo(script, database, args.get("format", "shell"))
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
+    res = _run_mongo(script, database, args.get("format", "shell"), maxbytes=maxb)
     log_event({"ev": "mongo_query", "database": database, "write": bool(reason),
                "confirm": bool(args.get("confirm")), "script": script[:200], "ok": res.get("ok")})
     if not res.get("ok"):
@@ -4298,7 +4326,10 @@ def tool_mongo_schema(args):
     else:
         sample = max(1, min(int(args.get("sample", 25)), 200))
         script, what = _mongo_describe_js(coll, sample), "%s.%s" % (database, coll)
-    res = _run_mongo(script, database, "shell", timeout=60)
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
+    res = _run_mongo(script, database, "shell", timeout=60, maxbytes=maxb)
     log_event({"ev": "mongo_schema", "database": database, "collection": coll, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("mongo schema failed: %s" % _mongo_err(res), True)
@@ -4360,7 +4391,7 @@ TOOLS = [
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
                 "grep": {"type": "string", "description": "Optional substring filter. file: searches the whole file and returns numbered matching lines; console/docker: filters the tailed lines."},
-                "maxbytes": {"type": "integer", "description": "Byte cap on returned text (max 200000). console/docker keep the most recent slice (default 48000); file keeps whole lines from the start of the window and names the next offset (default 12000). ANSI color codes are always stripped."},
+                "maxbytes": {"type": "integer", "default": 12000, "description": "Byte cap on returned text (max 200000). console/docker keep the most recent slice; file keeps whole lines from the start of the window and names the next offset. ANSI color codes are always stripped."},
                 "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
                 "overwrite": {"type": "boolean", "default": False, "description": "Allow save_to to replace an existing local file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required when save_to is used because that writes to the local filesystem."},
@@ -4377,7 +4408,7 @@ TOOLS = [
                 "server": SERVER_ENUM,
                 "command": {"type": "string", "description": "The console command, e.g. 'status' or 'ulx adduser ...'."},
                 "grep": {"type": "string", "description": "Optional substring filter on captured output."},
-                "maxbytes": {"type": "integer", "default": 24000, "description": "Byte cap on the returned console.log delta (keeps the most-recent slice)."},
+                "maxbytes": {"type": "integer", "default": 8000, "description": "Byte cap on the returned output (keeps the most recent slice; max 200000)."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for every command not on the explicit read-only allowlist."},
             },
             "required": ["server", "command"],
@@ -4447,7 +4478,7 @@ TOOLS = [
                           "items": {"type": "string"}, "description": "Multiple filename include globs (OR)."},
                 "exclude_globs": {"type": "array", "maxItems": 50,
                                   "items": {"type": "string"}, "description": "Filename globs to exclude."},
-                "max": {"type": "integer", "default": 200, "description": "Max matches (or files with output='files') to return; the total is still counted."},
+                "max": {"type": "integer", "default": 50, "description": "Max matches (or files with output='files') to return, up to 2000; the total is still counted."},
                 "regex": {"type": "string", "enum": ["basic", "extended", "fixed", "perl"], "default": "basic",
                           "description": "Pattern syntax: basic (grep -G), extended (-E: a|b, +, ?, {n}), fixed strings (-F), or perl (-P: \\d, \\b, lookaround)."},
                 "ignore_case": {"type": "boolean", "default": False, "description": "Case-insensitive matching (grep -i)."},
@@ -4475,7 +4506,7 @@ TOOLS = [
                                     "properties": {"path": {"type": "string"}, "path_b": {"type": "string"}, "local": {"type": "string"}},
                                     "required": ["path"]}},
                 "context": {"type": "integer", "default": 3, "description": "Diff context lines for every comparison (0-100)."},
-                "maxbytes": {"type": "integer", "default": 48000, "description": "BATCH mode aggregate unified-diff output budget in bytes (max 200000); every file is still accounted for in the status summary."},
+                "maxbytes": {"type": "integer", "default": 16000, "description": "BATCH mode aggregate unified-diff output budget in bytes (max 200000); every file is still accounted for in the status summary."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for local-file comparisons because local contents cross the SSH boundary; not needed server-to-server."},
             },
             "required": ["server"],
@@ -4560,7 +4591,7 @@ TOOLS = [
                         "and MariaDB/MySQL executable comments require confirm=true. `database` accepts a raw schema "
                         "name OR any alias defined in db_aliases in config.json.%s Output is TSV by default "
                         "(token-lean; tabs/newlines in values are escaped); format='table' for a bordered "
-                        "human-readable table. Capped ~40KB — add LIMIT for big tables." % _ALIAS_TXT),
+                        "human-readable table. Output defaults to 12 KB (maxbytes up to 200000); add LIMIT for big tables." % _ALIAS_TXT),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4593,8 +4624,8 @@ TOOLS = [
                         "The script is evaluated like a mongosh "
                         "REPL line, so the last expression's value is printed: `db.mail.find({to:'765..'})"
                         ".limit(5)` works as-is; use print()/EJSON.stringify() for custom output. `database` "
-                        "accepts a raw db name OR an alias from mongo_aliases in config.json.%s Output capped "
-                        "~40KB — always .limit() big collections." % (_MONGO_NOTE_TXT, _MONGO_ALIAS_TXT)),
+                        "accepts a raw db name OR an alias from mongo_aliases in config.json.%s Output defaults "
+                        "to 12 KB (maxbytes up to 200000); always .limit() big collections." % (_MONGO_NOTE_TXT, _MONGO_ALIAS_TXT)),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4632,6 +4663,9 @@ _BACKUP_ID_SCHEMA = {"type": "string", "pattern": "^(?:[0-9]{20}-[0-9a-f]{16}|le
                      "description": "Restore source version from fetch history/backups; required for restore."}
 for _schema_tool in TOOLS:
     _props = _schema_tool["inputSchema"]["properties"]
+    if _schema_tool["name"] in ("srcds_db_query", "srcds_db_schema", "srcds_mongo_query", "srcds_mongo_schema"):
+        _props["maxbytes"] = {"type": "integer", "default": DB_DEFAULT_MAXBYTES,
+                              "description": "Byte cap on returned output (max %d)." % OUTPUT_MAX_BYTES}
     if _schema_tool["name"] == "srcds_deploy":
         _schema_tool["description"] = ("Guarded file deployment. SINGLE: to + expected_sha256 + exactly one of local/content. "
             "BATCH: files=[{to,expected_sha256,local|content},...] in one call. Fresh target resolution, per-volume lock, "

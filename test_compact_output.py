@@ -391,5 +391,64 @@ class GrepOutputTests(ToolTestCase):
             run.assert_not_called()
 
 
+class DefaultBudgetTests(ToolTestCase):
+    def sent(self, tool, result, **args):
+        """The driver request a tool sends, given a canned driver result."""
+        args.setdefault("server", MCP.SERVER_NAMES[0])
+        with mock.patch.object(MCP, "run_driver", return_value=result) as run, \
+             mock.patch.object(MCP, "resolve", return_value=self.h.srv), \
+             mock.patch.object(MCP, "log_event"):
+            text, error = getattr(MCP, tool)(args)
+        self.assertFalse(error, text)
+        return run.call_args.args[0], text
+
+    def test_defaults_are_sized_for_repeated_calls(self):
+        console = {"ok": True, "output": "x", "condebug": True}
+        self.assertEqual(self.sent("tool_console", console, command="status")[0]["maxbytes"], 8000)
+        fetched = {"ok": True, "content": "", "path": "garrysmod/console.log"}
+        self.assertEqual(self.sent("tool_fetch", fetched, what="console")[0]["maxbytes"], 12000)
+        self.assertEqual(self.sent("tool_fetch", fetched, what="docker")[0]["maxbytes"], 12000)
+        self.assertEqual(self.sent("tool_grep", {"ok": True}, pattern="x")[0]["max"], 50)
+        rows = {"ok": True, "output": "1"}
+        self.assertEqual(self.sent("tool_db_query", rows, sql="SELECT 1")[0]["maxbytes"], 12000)
+        self.assertEqual(self.sent("tool_db_schema", rows)[0]["maxbytes"], 12000)
+        self.assertEqual(self.sent("tool_mongo_schema", rows)[0]["maxbytes"], 12000)
+        self.assertEqual(self.sent("tool_db_query", rows, sql="SELECT 1", maxbytes=10 ** 9)[0]["maxbytes"], 200000)
+        local = self.write("local.lua", b"x")
+        diff = {"ok": True, "results": [{"ok": True, "equal": True}]}
+        req, _ = self.sent("tool_diff", diff, files=[{"path": "lua/x.lua", "local": str(local)}], confirm=True)
+        self.assertEqual(req["maxbytes"], 16000)
+
+    def test_non_integer_db_budget_fails_before_transport(self):
+        with mock.patch.object(MCP, "run_driver") as run:
+            text, error = MCP.tool_db_query({"sql": "SELECT 1", "maxbytes": "lots"})
+        self.assertTrue(error)
+        run.assert_not_called()
+
+    def test_standing_guidance_is_printed_once(self):
+        noted = {"ok": True, "output": "x", "condebug": False, "note": "no -condebug: pty capture"}
+        self.assertIn("(note: no -condebug", self.sent("tool_console", noted, command="status")[1])
+        self.assertNotIn("(note:", self.sent("tool_console", noted, command="status")[1])
+        self.write("lua/a.lua", "x")
+        first, _ = self.h.call("tool_fetch", what="hash", path="lua")
+        again, _ = self.h.call("tool_fetch", what="hash", path="lua")
+        self.assertIn("TIP:", first)
+        self.assertNotIn("TIP:", again)
+        acked = {"ok": True, "result": {
+            "started": True, "ended": True, "ret": "1", "sum": "p=1 f=0", "fails": [],
+            "out": "clientlua ack: sent=1 ready=1 acked=1 ok=1 compile_error=0 runtime_error=0 transfer_error=0 timeout=0"}}
+        args = dict(code="print(1)", target="76561198000000000", confirm=True)
+        self.assertIn("visual/player acceptance remains separate", self.sent("tool_clientlua", acked, **args)[1])
+        self.assertNotIn("visual/player", self.sent("tool_clientlua", acked, **args)[1])
+
+    def test_listings_have_no_fixed_width_padding(self):
+        self.write("lua/a.lua", "x")
+        (self.f.gm / "lua/sub").mkdir()
+        text, _ = self.h.call("tool_fetch", what="dir", path="lua")
+        self.assertRegex(text, r"\na\.lua  1  \d{4}-\d\d-\d\d \d\d:\d\d\nsub/$")
+        hashed, _ = self.h.call("tool_fetch", what="hash", path="lua")
+        self.assertIn("\n%s 1 a.lua" % sha(b"x"), hashed)
+
+
 if __name__ == "__main__":
     unittest.main()
