@@ -45,6 +45,8 @@ DEPLOY_BATCH_MAX_INPUT_BYTES = 256 * 1024 * 1024
 GREP_MAX_PATTERNS = 20
 GREP_MAX_GLOBS = 50
 GREP_MAX_PATHS = 25
+FETCH_DEFAULT_MAXBYTES = 12000
+FILE_LINE_MAX_CHARS = 2000
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_KEEP = 3
 
@@ -202,6 +204,7 @@ DIFF_FILE_MAX_BYTES = @DIFF_FILE_MAX_BYTES@
 DIFF_BATCH_MAX_INPUT_BYTES = @DIFF_BATCH_MAX_INPUT_BYTES@
 DEPLOY_FILE_MAX_BYTES = @DEPLOY_FILE_MAX_BYTES@
 DEPLOY_BATCH_MAX_INPUT_BYTES = @DEPLOY_BATCH_MAX_INPUT_BYTES@
+FILE_LINE_MAX_CHARS = @FILE_LINE_MAX_CHARS@              # longer (minified) lines are cut in numbered reads
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")             # SGR/color escapes (console.log noise)
 
 def jout(o):
@@ -631,20 +634,22 @@ def op_fetch(req):
         truncated = orig > maxb
         if truncated:
             out = "...[truncated: last %d of %d chars]...\n%s" % (maxb, orig, out[orig - maxb:])
-        return {"ok": True, "path": "docker logs %s (tail %d)" % (u[:8], n),
+        return {"ok": True, "path": "docker logs (tail %d)" % n,
                 "content": out, "truncated": truncated}
 
+    # Results name files relative to garrysmod/: host paths embed the volume UUID.
     if what == "console":
         p = gm + "/console.log"
+        shown = "console.log"
     elif what == "file":
-        rel = req.get("path", "")
-        p = _safe_under(gm, rel)
+        shown = str(req.get("path") or "").lstrip("/")
+        p = _safe_under(gm, shown)
         if not p:
             return {"ok": False, "error": "path escapes volume"}
     else:
         return {"ok": False, "error": "unknown what: %s" % what}
     if not os.path.isfile(p):
-        return {"ok": False, "exists": False, "error": "no such file: %s" % p}
+        return {"ok": False, "exists": False, "error": "no such file: garrysmod/%s" % shown}
     if what == "file" and req.get("b64"):
         # binary-safe download: raw bytes as base64 (the client saves them locally;
         # the payload never reaches the model). Hard size cap.
@@ -660,17 +665,13 @@ def op_fetch(req):
         except OSError as e:
             return {"ok": False, "error": str(e)}
         import hashlib
-        return {"ok": True, "path": p, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+        return {"ok": True, "path": "garrysmod/" + shown, "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
                 "content_b64": base64.b64encode(data).decode()}
-    source_sha256 = None
+    if what == "file":
+        return _read_text_file(p, shown, req)
     try:
         with open(p, "rb") as f:
-            if what == "file":
-                import hashlib
-                h = hashlib.sha256()
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-                source_sha256 = h.hexdigest()
             f.seek(0, 2)
             size = f.tell()
             block = min(size, lines * 400 + 8192)
@@ -698,8 +699,93 @@ def op_fetch(req):
         if 0 <= nl < 240:
             tail = tail[nl + 1:]
         tail = "...[truncated: last %d of %d chars]...\n%s" % (len(tail), orig, tail)
-    return {"ok": True, "path": p, "content": tail, "size": size,
-            "truncated": truncated, "bytes": len(tail), "sha256": source_sha256}
+    return {"ok": True, "path": "garrysmod/" + shown, "content": tail, "size": size,
+            "truncated": truncated, "bytes": len(tail), "sha256": None}
+
+FILE_SCAN_LINE_BYTES = 1 << 22    # one pathological line is scanned up to 4 MiB
+
+def _file_lines(f, h=None):
+    """Yield (line number, raw bytes without newline); feed every block to h."""
+    pending = b""
+    n = 0
+    for block in iter(lambda: f.read(1 << 20), b""):
+        if h is not None:
+            h.update(block)
+        parts = (pending + block).split(b"\n")
+        pending = parts.pop()[:FILE_SCAN_LINE_BYTES]
+        for part in parts:
+            n += 1
+            yield n, part
+    if pending:
+        yield n + 1, pending
+
+def _read_text_file(p, shown, req):
+    """Numbered read of a whole text file. One pass yields the full SHA-256 and the
+    exact line count, plus either the offset/lines window or whole-file grep matches
+    (negative offset = from the end, which takes a second pass). Never a silent tail."""
+    import hashlib
+    try:
+        offset = max(-100000, int(req.get("offset") or 1)) or 1
+        limit = max(1, min(int(req.get("lines", 200)), 5000))
+        maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "offset, lines and maxbytes must be integers"}
+    pat = req.get("grep") or ""
+    needle = pat.encode("utf-8") if pat else None
+    keep = FILE_LINE_MAX_CHARS * 4 + 4          # enough raw bytes for the displayed prefix
+    h = hashlib.sha256()
+    total = matches = in_scope = 0
+    picked = []
+
+    def consider(n, raw):
+        nonlocal in_scope
+        if n >= start and (needle is None or needle in raw):
+            in_scope += 1
+            if len(picked) < limit:
+                picked.append((n, raw[:keep], len(raw)))
+
+    try:
+        with open(p, "rb") as f:
+            binary = b"\x00" in f.read(8192)
+            f.seek(0)
+            if binary:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+                return {"ok": True, "path": "garrysmod/" + shown, "size": f.tell(),
+                        "sha256": h.hexdigest(), "binary": True, "content": "", "shown": 0}
+            start = offset if offset > 0 else float("inf")
+            for n, raw in _file_lines(f, h):
+                total = n
+                if needle is not None and needle in raw:
+                    matches += 1
+                consider(n, raw)
+            size = f.tell()
+            if offset < 0:
+                start = max(1, total + offset + 1)
+                f.seek(0)
+                for n, raw in _file_lines(f):
+                    consider(n, raw)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    out, used, last, cut = [], 0, None, 0
+    for n, raw, full_len in picked:
+        text = _ANSI_RE.sub("", raw.decode("utf-8", "replace").rstrip("\r"))
+        if full_len > len(raw) or len(text) > FILE_LINE_MAX_CHARS:
+            text = text[:FILE_LINE_MAX_CHARS]
+            text += "...<+%d bytes>" % max(0, full_len - len(text.encode("utf-8")))
+            cut += 1
+        line = "%d\t%s" % (n, text)
+        if out and used + len(line) + 1 > maxb:
+            break
+        out.append(line)
+        used += len(line) + 1
+        last = n
+    return {"ok": True, "path": "garrysmod/" + shown, "size": size, "sha256": h.hexdigest(),
+            "binary": False, "total_lines": total, "start": start, "grep": needle is not None,
+            "matches": matches, "in_scope": in_scope, "shown": len(out),
+            "first": picked[0][0] if out else None, "last": last,
+            "more": len(out) < in_scope, "byte_capped": len(out) < len(picked),
+            "cut_lines": cut, "content": "\n".join(out)}
 
 def _safe_under(gm, rel):
     """Resolve a path beneath root without prefix-collision or symlink escapes."""
@@ -1886,6 +1972,7 @@ def _render_driver(tmpl):
              .replace("@DIFF_BATCH_MAX_INPUT_BYTES@", str(DIFF_BATCH_MAX_INPUT_BYTES))
              .replace("@DEPLOY_FILE_MAX_BYTES@", str(DEPLOY_FILE_MAX_BYTES))
              .replace("@DEPLOY_BATCH_MAX_INPUT_BYTES@", str(DEPLOY_BATCH_MAX_INPUT_BYTES))
+             .replace("@FILE_LINE_MAX_CHARS@", str(FILE_LINE_MAX_CHARS))
              .replace("@SERVERS_JSON@", json.dumps(CFG["servers"])))
 
 
@@ -2667,14 +2754,15 @@ def tool_fetch(args):
             out.append("  %s  %s  %9s  %s" % (b.get("backup_id", "legacy"), b["path"], b["size"], _fmt_mtime(b["mtime"])))
         return ("\n".join(out), False)
 
+    if what == "file" and not save_to:
+        return _fetch_file_text(server, srv, args)
     req = {"op": "fetch", "uuid": srv["uuid"], "what": what,
            "lines": int(args.get("lines", 200))}
     if args.get("maxbytes") is not None:
         req["maxbytes"] = int(args["maxbytes"])
     if what == "file":
         req["path"] = args.get("path", "")
-        if save_to:
-            req["b64"] = True
+        req["b64"] = True
     if args.get("grep"):
         req["grep"] = args["grep"]
     res = run_driver(req, timeout=(150 if save_to else 40))
@@ -2703,11 +2791,61 @@ def tool_fetch(args):
                 % (server.upper(), args.get("path", ""), save_to, len(data),
                    hashlib.sha256(data).hexdigest()), False)
     hdr = "[%s] %s (%s)" % (server.upper(), what, res.get("path", ""))
-    if res.get("sha256"):
-        hdr += "\nfull_file_sha256=" + res["sha256"] + " (text below may be filtered or tailed)"
     if res.get("truncated"):
         hdr += "  [byte-capped -> showing most recent; raise maxbytes or narrow via grep/lines for more]"
     return ("%s\n%s" % (hdr, res.get("content", "")), False)
+
+
+def _fetch_file_text(server, srv, args):
+    """Numbered file read: a window from line 1 (or offset), or whole-file grep hits."""
+    try:
+        req = {"op": "fetch", "uuid": srv["uuid"], "what": "file",
+               "path": args.get("path") or "", "offset": int(args.get("offset") or 1),
+               "lines": int(args.get("lines", 200)),
+               "maxbytes": int(args.get("maxbytes", FETCH_DEFAULT_MAXBYTES))}
+    except (TypeError, ValueError):
+        return ("offset, lines and maxbytes must be integers.", True)
+    if args.get("grep"):
+        req["grep"] = args["grep"]
+    res = run_driver(req, timeout=60)
+    log_event({"ev": "fetch", "server": server, "what": "file", "ok": res.get("ok"),
+               "more": res.get("more"), "grep": bool(req.get("grep"))})
+    if not res.get("ok"):
+        return ("fetch failed: %s" % res.get("error"), True)
+    return (_format_file_read(server, req, res), False)
+
+
+def _format_file_read(server, req, res):
+    head = "[%s] %s" % (server.upper(), res.get("path"))
+    sha = "full_file_sha256=%s" % res.get("sha256")
+    if res.get("binary"):
+        return "%s: binary file (%s bytes); download it with save_to.\n%s" % (head, res.get("size"), sha)
+    total, shown = res.get("total_lines", 0), res.get("shown", 0)
+    if res.get("grep"):
+        head += ": grep %s matched %d of %d lines" % (json.dumps(req.get("grep")), res.get("matches", 0), total)
+        if res.get("start", 1) > 1:
+            head += ", %d from line %d" % (res.get("in_scope", 0), res["start"])
+        if shown:
+            head += "; showing %d" % shown
+    elif shown:
+        head += ": lines %d-%d of %d" % (res["first"], res["last"], total)
+    else:
+        head += ": no lines from offset %d (file has %d lines)" % (req["offset"], total)
+    head += " (%s bytes)" % res.get("size")
+    if res.get("more"):
+        head += "; next offset=%d" % (res["last"] + 1)
+    notes = []
+    if res.get("byte_capped"):
+        notes.append("byte cap reached: raise maxbytes or continue at the next offset")
+    if res.get("cut_lines"):
+        notes.append("%d long line(s) cut at %d chars: use save_to for exact bytes"
+                     % (res["cut_lines"], FILE_LINE_MAX_CHARS))
+    text = head + "\n" + sha
+    if notes:
+        text += "\n(" + "; ".join(notes) + ")"
+    if res.get("content"):
+        text += "\n" + res["content"]
+    return text
 
 
 PANEL_URL = CFG.get("panel_url") or ""
@@ -3972,17 +4110,18 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': read a file; what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
+        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': read a file with line numbers from line 1 (page with offset/lines; grep searches the whole file and returns numbered matches); what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups", "docker"], "default": "console"},
-                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (docker max 2000)."},
+                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (max 2000). file: lines, or grep matches, per read (max 5000)."},
+                "offset": {"type": "integer", "default": 1, "description": "file: 1-based first line to return (with grep, the first line searched). Negative starts that many lines before the end: -50 reads the last 50 lines. The reply names the next offset when more remain."},
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
-                "grep": {"type": "string", "description": "Optional substring filter (console/file)."},
-                "maxbytes": {"type": "integer", "default": 48000, "description": "Byte cap on returned content (keeps the most-recent slice). ANSI color codes are always stripped."},
+                "grep": {"type": "string", "description": "Optional substring filter. file: searches the whole file and returns numbered matching lines; console/docker: filters the tailed lines."},
+                "maxbytes": {"type": "integer", "description": "Byte cap on returned text (max 200000). console/docker keep the most recent slice (default 48000); file keeps whole lines from the start of the window and names the next offset (default 12000). ANSI color codes are always stripped."},
                 "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
                 "overwrite": {"type": "boolean", "default": False, "description": "Allow save_to to replace an existing local file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required when save_to is used because that writes to the local filesystem."},
