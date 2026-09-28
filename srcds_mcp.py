@@ -35,6 +35,7 @@ MCP_SUPPORTED_PROTOCOLS = (
     "2025-11-25",
 )
 
+LUA_MAX_BYTES = 64 * 1024
 CLIENTLUA_MAX_BYTES = 64 * 1024
 CLIENTLUA_ACK_TIMEOUT = 15
 CLIENTLUA_MAX_RECIPIENTS = 128
@@ -2713,19 +2714,43 @@ def render_runner(tok, body_rel, want_async):
             .replace("@ASYNC@", "true" if want_async else "false"))
 
 
+def _lua_source(args, cap):
+    """Lua from exactly one of code (inline) or local (a UTF-8 file on this machine).
+    A local file lets an agent rerun a suite without re-sending it as output tokens."""
+    code, local = args.get("code"), args.get("local")
+    if isinstance(code, str) and not code.strip():
+        code = None
+    if (code is None) == (not local):
+        return None, "give exactly one of code (inline Lua) or local (path of a local Lua file)"
+    if code is not None:
+        return (code, None) if isinstance(code, str) else (None, "code must be a string")
+    if not isinstance(local, str):
+        return None, "local must be a file path"
+    data, err = _read_local_capped(local, cap)
+    if err:
+        return None, err
+    try:
+        code = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "local file is not valid UTF-8"
+    if not code.strip():
+        return None, "local file is empty"
+    return code, None
+
+
 def tool_lua(args):
     server = args.get("server")
-    code = args.get("code", "")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    if not code.strip():
-        return ("code is empty", True)
+    code, err = _lua_source(args, LUA_MAX_BYTES)
+    if err:
+        return (err, True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     if not srv["running"]:
         return ("%s is DOWN — cannot run Lua (the server process isn't running)." % server.upper(), True)
-    if len(code) > 64 * 1024:
+    if len(code) > LUA_MAX_BYTES:
         return ("code too large (>64KB)", True)
     if "~|~" in code or "__MCP" in code:
         return ("code may not contain the reserved markers '~|~' or '__MCP'", True)
@@ -2747,7 +2772,8 @@ def tool_lua(args):
                       "capture_timeout": 7, "async_timeout": atimeout},
                      timeout=(atimeout + 30 if want_async else 55))
     log_event({"ev": "lua", "server": server, "confirm": bool(args.get("confirm")),
-               "async": want_async, "ok": res.get("ok"), "code": code[:200]})
+               "async": want_async, "ok": res.get("ok"), "code": code[:200],
+               "source": "local" if args.get("local") else "inline"})
     if not res.get("ok"):
         return ("lua failed: %s" % res.get("error"), True)
 
@@ -3735,9 +3761,9 @@ def tool_clientlua(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    code = args.get("code", "")
-    if not code.strip():
-        return ("code is empty", True)
+    code, err = _lua_source(args, CLIENTLUA_MAX_BYTES)
+    if err:
+        return (err, True)
     code_bytes = code.encode("utf-8")
     if len(code_bytes) > CLIENTLUA_MAX_BYTES:
         return ("clientlua code too large: %d UTF-8 bytes (max %d)" %
@@ -3779,7 +3805,8 @@ def tool_clientlua(args):
                       "runner": runner, "async": True,
                       "async_timeout": CLIENTLUA_ACK_TIMEOUT + 3}, timeout=60)
     log_event({"ev": "clientlua", "server": server, "target": target,
-               "bytes": len(code_bytes), "broadcast": target == "all", "ok": res.get("ok")})
+               "bytes": len(code_bytes), "broadcast": target == "all", "ok": res.get("ok"),
+               "source": "local" if args.get("local") else "inline"})
     if not res.get("ok"):
         return ("clientlua failed: %s" % res.get("error"), True)
     r = res.get("result") or {}
@@ -4432,11 +4459,13 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Server Lua / verification suite. e.g. 'return player.GetCount()' or a multi-line CHECK/EQ assertion suite. Use `return <expr>` or LOG(...) to get values back."},
+                "local": {"type": "string", "description": "Instead of code: path of a local UTF-8 Lua file (max 64 KiB). Write a suite once and rerun it by path."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for every srcds_lua call."},
                 "async": {"type": "boolean", "default": False, "description": "True for suites using timers/coroutines/http; then call MCP_DONE() from the final callback."},
                 "async_timeout": {"type": "integer", "default": 20, "description": "Seconds to wait for MCP_DONE() when async=true (max ~30)."},
             },
-            "required": ["server", "code"],
+            "required": ["server"],
+            "anyOf": [{"required": ["code"]}, {"required": ["local"]}],
         },
     },
     {
@@ -4531,12 +4560,14 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Clientside Lua to run on the target players."},
+                "local": {"type": "string", "description": "Instead of code: path of a local UTF-8 Lua file (max 64 KiB)."},
                 "target": {"type": "string", "description": "Required: 'all', exact SteamID, or exact 17-digit SteamID64. Nicknames are intentionally rejected."},
                 "broadcast": {"type": "boolean", "default": False, "description": "Required true when target='all'."},
                 "force": {"type": "boolean", "default": False, "description": "Required true when target='all', even if A2S reports quiet/unknown."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true (executes code on clients)."},
             },
-            "required": ["server", "code", "target"],
+            "required": ["server", "target"],
+            "anyOf": [{"required": ["code"]}, {"required": ["local"]}],
         },
     },
     {

@@ -450,5 +450,45 @@ class DefaultBudgetTests(ToolTestCase):
         self.assertIn("\n%s 1 a.lua" % sha(b"x"), hashed)
 
 
+class LocalLuaSourceTests(ToolTestCase):
+    RESULT = {"ok": True, "result": {"started": True, "ended": True, "ret": "1", "sum": "p=1 f=0", "fails": [],
+              "out": "clientlua ack: sent=1 ready=1 acked=1 ok=1 compile_error=0 runtime_error=0 transfer_error=0 timeout=0"}}
+
+    def run_tool(self, tool, **args):
+        args.setdefault("server", MCP.SERVER_NAMES[0])
+        with mock.patch.object(MCP, "run_driver", return_value=self.RESULT) as run, \
+             mock.patch.object(MCP, "resolve", return_value=self.h.srv), \
+             mock.patch.object(MCP, "live_info", return_value=(0, 10, False)), \
+             mock.patch.object(MCP, "log_event"):
+            text, error = getattr(MCP, tool)(args)
+        return text, error, run
+
+    def test_lua_runs_a_local_file_verbatim(self):
+        suite = self.write("suite.lua", "CHECK(true, 'ok')\nreturn 1\n")
+        text, error, run = self.run_tool("tool_lua", confirm=True, **{"local": str(suite)})
+        self.assertFalse(error, text)
+        self.assertEqual(run.call_args.args[0]["body"], "CHECK(true, 'ok')\nreturn 1\n")
+
+    def test_clientlua_sends_a_local_file(self):
+        script = self.write("cl.lua", "print('hud')")
+        text, error, run = self.run_tool("tool_clientlua", target="76561198000000000", confirm=True,
+                                         **{"local": str(script)})
+        self.assertFalse(error, text)
+        self.assertIn(MCP.base64.b64encode(b"print('hud')").decode(), run.call_args.args[0]["body"])
+
+    def test_exactly_one_readable_utf8_source(self):
+        good = self.write("good.lua", "return 1")
+        cases = [dict(code="return 1", **{"local": str(good)}), {}, {"code": "  "},
+                 {"local": str(self.write("empty.lua", ""))},
+                 {"local": str(self.write("latin1.lua", b"\xe9"))},
+                 {"local": str(self.write("big.lua", b"-" * (64 * 1024 + 1)))},
+                 {"local": str(self.f.root / "missing.lua")}]
+        for tool, extra in (("tool_lua", {}), ("tool_clientlua", {"target": "76561198000000000"})):
+            for case in cases:
+                text, error, run = self.run_tool(tool, confirm=True, **dict(case, **extra))
+                self.assertTrue(error, (tool, case, text))
+                run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
