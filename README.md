@@ -189,19 +189,29 @@ and the full-file SHA-256 to keep as a deploy base. A negative `offset` counts
 back from the end (`-50` reads the last 50 lines). `grep` searches the whole
 file and returns numbered matching lines. Lines over 2000 characters are cut
 with a marker, and binary files are summarized; use `save_to` for exact bytes.
+Matching scans every byte even in very long lines, while retaining only a
+bounded display prefix. File-read payload budgets count UTF-8 bytes; a budget
+too small for the first displayed line returns an error with the required size.
+
+History receipts marked `uncertain` show planned hashes as unconfirmed. A
+prepared receipt does not establish that a write or backup completed; inspect
+the current file hashes and available backups before retrying.
 
 ## Output budgets
 
 Results stay in an agent's context for the rest of a session, so default
 budgets are small: console 8 KB, fetch 12 KB, grep 50 matches, batch diff
-16 KB, and DB/Mongo 12 KB. Each can be raised with `maxbytes` (or `max`) up to
-200000 bytes, and truncated results say how. Guidance that does not change
-between calls is printed once per MCP process.
+16 KB, and DB/Mongo 12 KB. Raise `maxbytes` up to 200000, or grep's `max` up to
+2000 matches. Truncated results say how to request more. Guidance that does
+not change between calls is printed once per MCP process.
 
 ## Server Lua verification
 
 Every `srcds_lua` call requires `confirm:true`. Pass the suite as `code`, or
 as `local`, the path of a local UTF-8 file, to rerun it without resending it.
+Both forms have the same 64 KiB UTF-8 source limit.
+The runner isolates plain global assignments but retains access to shared
+tables and engine APIs. Only trusted, explicitly authorized code should run.
 The runner supplies:
 
 ```text

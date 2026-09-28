@@ -5,6 +5,7 @@ and no game server.
 """
 import json
 import re
+import sys
 import time
 import unittest
 from unittest import mock
@@ -322,6 +323,7 @@ class DiffAndDeployOutputTests(ToolTestCase):
         self.assertEqual(len(again.split("\n")), 2, again)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "host grep integration requires Linux and GNU grep")
 class GrepOutputTests(ToolTestCase):
     def setUp(self):
         super().setUp()
@@ -441,6 +443,7 @@ class DefaultBudgetTests(ToolTestCase):
         self.assertIn("visual/player acceptance remains separate", self.sent("tool_clientlua", acked, **args)[1])
         self.assertNotIn("visual/player", self.sent("tool_clientlua", acked, **args)[1])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "host listing paths require Linux")
     def test_listings_have_no_fixed_width_padding(self):
         self.write("lua/a.lua", "x")
         (self.f.gm / "lua/sub").mkdir()

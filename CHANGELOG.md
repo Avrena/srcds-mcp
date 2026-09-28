@@ -11,12 +11,15 @@ and removes repeated content from the largest results.
   from the end), and states the range, the line count and the next offset. It
   used to return the last 200 lines without saying so. `grep` searches the
   whole file instead of that tail. Long lines are cut visibly and binary files
-  are summarized.
+  are summarized. Matches across read blocks and beyond 4 MiB on a single line
+  are included. File-read payload limits count UTF-8 bytes, including the first
+  line; insufficient budgets return a size hint instead of oversized output.
 - **Deployment history per deployment.** `what="history"` lists one line per
   deployment (outcome, file counts, bytes, first path) instead of raw receipts
   pretty-printed twice per deployment: after one 400-file deploy the first page
   is 256 characters instead of 184 KB. `deployment_id` pages one deployment's
-  files with full hashes.
+  files with full hashes. Prepared-only receipts identify unconfirmed plans
+  without claiming completed writes or available backups.
 - **Monitor deltas.** `srcds_monitor` checks return only matches after `after`,
   oldest first, with the cursor for the next check, and count unseen matches
   that the 50-match buffer dropped.
@@ -33,7 +36,8 @@ and removes repeated content from the largest results.
   200000). Guidance that does not change between calls is printed once per
   process.
 - **Local Lua sources.** `srcds_lua` and `srcds_clientlua` accept `local`, the
-  path of a local Lua file, instead of `code`.
+  path of a local Lua file, instead of `code`. The server Lua limit is 64 KiB
+  of UTF-8 bytes for either form, checked before server discovery.
 - Results name paths relative to `garrysmod/` instead of host paths containing
   the volume UUID. Listings drop fixed-width padding. The deploy schema no
   longer lists the always-true `backup` flag; `backup=false` is still rejected.

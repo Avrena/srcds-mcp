@@ -709,22 +709,33 @@ def op_fetch(req):
     return {"ok": True, "path": "garrysmod/" + shown, "content": tail, "size": size,
             "truncated": truncated, "bytes": len(tail), "sha256": None}
 
-FILE_SCAN_LINE_BYTES = 1 << 22    # one pathological line is scanned up to 4 MiB
-
-def _file_lines(f, h=None):
-    """Yield (line number, raw bytes without newline); feed every block to h."""
-    pending = b""
+def _file_lines(f, h=None, needle=None):
+    """Scan every byte with bounded line storage, including cross-block matches.
+    Yield (line number, display prefix, full byte length, matched)."""
+    keep = FILE_LINE_MAX_CHARS * 4 + 4
+    prefix = overlap = b""
+    full_len = 0
+    matched = needle is None
     n = 0
     for block in iter(lambda: f.read(1 << 20), b""):
         if h is not None:
             h.update(block)
-        parts = (pending + block).split(b"\n")
-        pending = parts.pop()[:FILE_SCAN_LINE_BYTES]
-        for part in parts:
-            n += 1
-            yield n, part
-    if pending:
-        yield n + 1, pending
+        parts = block.split(b"\n")
+        for i, part in enumerate(parts):
+            full_len += len(part)
+            prefix += part[:max(0, keep - len(prefix))]
+            if not matched:
+                candidate = overlap + part
+                matched = needle in candidate
+                overlap = candidate[-(len(needle) - 1):] if len(needle) > 1 else b""
+            if i < len(parts) - 1:
+                n += 1
+                yield n, prefix, full_len, matched
+                prefix = overlap = b""
+                full_len = 0
+                matched = needle is None
+    if full_len:
+        yield n + 1, prefix, full_len, matched
 
 def _read_text_file(p, shown, req):
     """Numbered read of a whole text file. One pass yields the full SHA-256 and the
@@ -739,17 +750,16 @@ def _read_text_file(p, shown, req):
         return {"ok": False, "error": "offset, lines and maxbytes must be integers"}
     pat = req.get("grep") or ""
     needle = pat.encode("utf-8") if pat else None
-    keep = FILE_LINE_MAX_CHARS * 4 + 4          # enough raw bytes for the displayed prefix
     h = hashlib.sha256()
     total = matches = in_scope = 0
     picked = []
 
-    def consider(n, raw):
+    def consider(n, raw, full_len, matched):
         nonlocal in_scope
-        if n >= start and (needle is None or needle in raw):
+        if n >= start and matched:
             in_scope += 1
             if len(picked) < limit:
-                picked.append((n, raw[:keep], len(raw)))
+                picked.append((n, raw, full_len))
 
     try:
         with open(p, "rb") as f:
@@ -761,31 +771,35 @@ def _read_text_file(p, shown, req):
                 return {"ok": True, "path": "garrysmod/" + shown, "size": f.tell(),
                         "sha256": h.hexdigest(), "binary": True, "content": "", "shown": 0}
             start = offset if offset > 0 else float("inf")
-            for n, raw in _file_lines(f, h):
+            for n, raw, full_len, matched in _file_lines(f, h, needle):
                 total = n
-                if needle is not None and needle in raw:
+                if needle is not None and matched:
                     matches += 1
-                consider(n, raw)
+                consider(n, raw, full_len, matched)
             size = f.tell()
             if offset < 0:
                 start = max(1, total + offset + 1)
                 f.seek(0)
-                for n, raw in _file_lines(f):
-                    consider(n, raw)
+                for n, raw, full_len, matched in _file_lines(f, needle=needle):
+                    consider(n, raw, full_len, matched)
     except OSError as e:
         return {"ok": False, "error": str(e)}
     out, used, last, cut = [], 0, None, 0
     for n, raw, full_len in picked:
         text = _ANSI_RE.sub("", raw.decode("utf-8", "replace").rstrip("\r"))
-        if full_len > len(raw) or len(text) > FILE_LINE_MAX_CHARS:
+        cut_line = full_len > len(raw) or len(text) > FILE_LINE_MAX_CHARS
+        if cut_line:
             text = text[:FILE_LINE_MAX_CHARS]
             text += "...<+%d bytes>" % max(0, full_len - len(text.encode("utf-8")))
-            cut += 1
         line = "%d\t%s" % (n, text)
-        if out and used + len(line) + 1 > maxb:
+        cost = len(line.encode("utf-8")) + 1
+        if used + cost > maxb:
+            if not out:
+                return {"ok": False, "error": "maxbytes is too small for line %d; raise maxbytes to at least %d or use save_to" % (n, cost)}
             break
         out.append(line)
-        used += len(line) + 1
+        used += cost
+        cut += cut_line
         last = n
     return {"ok": True, "path": "garrysmod/" + shown, "size": size, "sha256": h.hexdigest(),
             "binary": False, "total_lines": total, "start": start, "grep": needle is not None,
@@ -1019,11 +1033,13 @@ def _history_entry(ident, recs, prefix):
         outcome = "rejected"
     else:
         outcome = "uncertain"          # prepared without a result: interrupted
-    counts = {"new": 0, "replaced": 0, "unchanged": 0, "failed": 0}
+    counts = {"new": 0, "replaced": 0, "unchanged": 0, "failed": 0, "unconfirmed": 0}
     changed_bytes = 0
     for e in files if outcome != "rejected" else ():
         if e.get("ok") is False:
             counts["failed"] += 1
+        elif e.get("ok") is not True:
+            counts["unconfirmed"] += 1
         elif e.get("noop") or e.get("before_sha256") == e.get("after_sha256"):
             counts["unchanged"] += 1
         else:
@@ -2635,8 +2651,8 @@ local function _finalize(kind)
 end
 _scratch.MCP_DONE = function() _finalize("DON") end
 
--- sandbox env: body global READS fall through to _G; body global WRITES go to a
--- scratch table => zero _G pollution from the body's own globals (no cleanup needed).
+-- Plain global assignments go to a scratch table. Reads fall through to _G;
+-- shared tables and engine APIs remain accessible, so this is not a security sandbox.
 -- capture body print/Msg/MsgN as framed OUT lines (clean separation from other
 -- players' live console spam, which the driver drops as unframed noise).
 _scratch.print = function(...) _scratch.LOG(...) end
@@ -2745,13 +2761,14 @@ def tool_lua(args):
     code, err = _lua_source(args, LUA_MAX_BYTES)
     if err:
         return (err, True)
+    code_size = len(code.encode("utf-8"))
+    if code_size > LUA_MAX_BYTES:
+        return ("Lua code too large: %d UTF-8 bytes (max %d)" % (code_size, LUA_MAX_BYTES), True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     if not srv["running"]:
         return ("%s is DOWN — cannot run Lua (the server process isn't running)." % server.upper(), True)
-    if len(code) > LUA_MAX_BYTES:
-        return ("code too large (>64KB)", True)
     if "~|~" in code or "__MCP" in code:
         return ("code may not contain the reserved markers '~|~' or '__MCP'", True)
     reason, band = classify_lua(code)
@@ -2849,6 +2866,8 @@ def _history_file_line(e, outcome):
     src = "  src=%s" % src if src and src != "inline" and not src.startswith("backup:") else ""
     if outcome == "rejected":
         return "%s  expected %s%s" % (e.get("to"), str(e.get("expected_sha256"))[:16], src)
+    if e.get("ok") is None:
+        return "%s  UNCONFIRMED planned_sha256=%s%s" % (e.get("to"), e.get("after_sha256") or "?", src)
     if e.get("ok") is False:
         return "%s  FAILED: %s" % (e.get("to"), str(e.get("error") or "")[:200])
     before, after = e.get("before_sha256"), e.get("after_sha256") or "?"
@@ -2876,6 +2895,8 @@ def _format_history(server, res):
                 c.get("to"), c.get("expected_sha256"), c.get("actual_sha256")))
         if (s.get("counts") or {}).get("replaced"):
             out.append("replaced files are restorable with backup_id=%s" % s["deployment_id"])
+        if s.get("outcome") in ("uncertain", "partial_or_uncertain"):
+            out.append("Receipt does not confirm every write or backup: inspect live hashes and backups before retrying.")
         files, first = res.get("files") or [], res.get("offset", 1)
         total = res.get("total_files", len(files))
         if files:
