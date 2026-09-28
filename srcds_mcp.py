@@ -1818,6 +1818,13 @@ def op_monitor(req):
     if not d:
         return {"ok": False, "error": "no such monitor %s (verdicts GC after 24h)" % mid}
     d["elapsed"] = round(time.time() - d.get("armed", time.time()), 1)
+    if d.get("mode") == "pattern":
+        # Number matches by arrival and return only those after the caller's
+        # cursor; count the unseen ones the 50-match ring already dropped.
+        ring = d.get("matches") or []
+        first = int(d.get("match_count", 0)) - len(ring) + 1
+        d["matches"] = [[seq, t, line] for seq, (t, line) in enumerate(ring, first) if seq > after]
+        d["evicted"] = max(0, first - 1 - after)
     return {"ok": True, "watch": d, "id": mid}
 
 def _mariadb_cid():
@@ -3705,8 +3712,8 @@ def tool_monitor(args):
             return ("arm failed: watcher process did not come up (python3/docker missing on host?)", True)
         what = ("console regex /%s/" % pattern) if watch == "pattern" else ("server going %s" % watch.upper())
         return ("[%s] monitor ARMED — id=%s, watching %s for %d min.\n"
-                "Poll: srcds_monitor {server:'%s', id:'%s', wait:50} — returns early on a hit. "
-                "Disarm: action:'stop'." % (server.upper(), mid, what, timeout_min, server, mid), False)
+                "Poll: srcds_monitor {server:'%s', id:'%s', wait:50} returns early on a hit; then pass "
+                "after:<last # seen> to get only newer matches. Disarm: action:'stop'." % (server.upper(), mid, what, timeout_min, server, mid), False)
     if action == "list":
         res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "list"}, timeout=30)
         log_event({"ev": "monitor_list", "server": server, "ok": res.get("ok")})
@@ -3733,8 +3740,9 @@ def tool_monitor(args):
     if action != "check":
         return ("action must be one of: arm, check, stop, list", True)
     wait = max(0, min(int(args.get("wait", 0)), 55))
+    after = max(0, int(args.get("after", 0)))
     res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "check", "id": mid,
-                      "wait": wait, "after": int(args.get("after", 0))}, timeout=wait + 30)
+                      "wait": wait, "after": after}, timeout=wait + 30)
     log_event({"ev": "monitor_check", "server": server, "id": mid, "wait": wait, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("check failed: %s" % res.get("error"), True)
@@ -3745,13 +3753,18 @@ def tool_monitor(args):
                                                          (d.get("elapsed") or 0) / 60.0)]
     if mode == "pattern":
         mc = d.get("match_count", 0)
-        matches = d.get("matches") or []
+        new = d.get("matches") or []
+        evicted = d.get("evicted", 0)
         if mc:
-            lines[0] += "  matches=%d" % mc
-            if mc > 15:
-                lines.append("  (showing last 15 of %d — pass after:%d to await the next)" % (mc, mc))
-            for t, l in matches[-15:]:
-                lines.append("  [+%ss] %s" % (t, l))
+            lines[0] += "  matches=%d, %d new after #%d" % (mc, len(new) + evicted, after)
+        if evicted:
+            lines.append("  (%d unseen match(es) were evicted from the 50-match buffer)" % evicted)
+        shown = new[:15]
+        for seq, t, l in shown:
+            lines.append("  #%d [+%ss] %s" % (seq, t, l))
+        if shown:
+            more = len(new) - len(shown)
+            lines.append("  next check: after=%d%s" % (shown[-1][0], (" (%d more waiting)" % more) if more else ""))
     else:
         hist = d.get("history") or []
         if hist:
@@ -4288,7 +4301,7 @@ TOOLS = [
                         "container console on ANY server (no -condebug needed); or watch:'down'/'up' fires on the "
                         "wings state transition — 'down' also captures the last 40 console lines at death (crash "
                         "forensics). Returns an id. CHECK: id + wait<=55 long-polls and returns early on a hit; "
-                        "pass after:<seen count> to await only NEW matches. action:'stop'+id disarms; no args "
+                        "pass after:<last # seen> to get only newer matches. action:'stop'+id disarms; no args "
                         "lists this server's monitors. Watchers auto-expire after timeout_min. The action field "
                         "can usually be omitted — it is inferred (pattern/watch=arm, id=check, neither=list)."),
         "inputSchema": {
@@ -4303,7 +4316,7 @@ TOOLS = [
                 "timeout_min": {"type": "integer", "default": 30, "description": "arm: watcher auto-expires after this many minutes (1-240)."},
                 "id": {"type": "string", "description": "check/stop: the monitor id returned by arm."},
                 "wait": {"type": "integer", "default": 0, "description": "check: long-poll up to this many seconds (<=55), returning early on a hit."},
-                "after": {"type": "integer", "default": 0, "description": "check (pattern): only return early when match_count EXCEEDS this — pass the count you already saw."},
+                "after": {"type": "integer", "default": 0, "description": "check (pattern): the last match # you saw. Only newer matches are returned, and a long poll returns early only when one arrives."},
             },
             "required": ["server"],
         },

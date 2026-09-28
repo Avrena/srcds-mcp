@@ -5,6 +5,7 @@ and no game server.
 """
 import json
 import re
+import time
 import unittest
 from unittest import mock
 
@@ -138,6 +139,49 @@ class FileReadTests(ToolTestCase):
         self.assertTrue(error)
         self.assertIn("integers", text)
         run.assert_not_called()
+
+
+class MonitorDeltaTests(ToolTestCase):
+    def setUp(self):
+        super().setUp()
+        self.f.ns["MONITOR_ROOT"] = str(self.f.root / "monitors")
+
+    def record(self, count):
+        """A pattern monitor that has seen `count` matches; the ring keeps the last 50."""
+        ring = [[float(i), "[ERROR] sv.lua:%d: boom" % i] for i in range(max(1, count - 49), count + 1)]
+        state = {"pid": 1, "nonce": "n", "mode": "pattern", "pattern": "ERROR",
+                 "armed": time.time() - 60, "phase": "triggered", "match_count": count,
+                 "matches": ring, "history": [], "note": ""}
+        root = self.f.root / "monitors"
+        root.mkdir(exist_ok=True)
+        (root / "unit_abcd1234.json").write_text(json.dumps(state))
+
+    def check(self, **args):
+        text, error = self.h.call("tool_monitor", id="abcd1234", **args)
+        self.assertFalse(error, text)
+        return text
+
+    def test_after_returns_only_unseen_matches(self):
+        self.record(11)
+        text = self.check(after=10)
+        self.assertIn("matches=11, 1 new after #10", text)
+        self.assertIn("#11 [+11.0s] [ERROR] sv.lua:11: boom", text)
+        self.assertNotIn("#10 ", text)
+        self.assertIn("next check: after=11", text)
+        idle = self.check(after=11)
+        self.assertIn("matches=11, 0 new after #11", idle)
+        self.assertNotIn("next check", idle)
+
+    def test_pages_oldest_first_and_counts_evicted_matches(self):
+        self.record(200)
+        text = self.check(after=100)
+        self.assertIn("matches=200, 100 new after #100", text)
+        self.assertIn("50 unseen match(es) were evicted", text)
+        self.assertIn("#151 ", text)
+        self.assertIn("#165 ", text)
+        self.assertNotIn("#166 ", text)
+        self.assertIn("next check: after=165 (35 more waiting)", text)
+        self.assertIn("#166 ", self.check(after=165))
 
 
 if __name__ == "__main__":
