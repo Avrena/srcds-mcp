@@ -24,7 +24,7 @@ and rotate beside the selected config file.
 import sys, os, json, base64, subprocess, socket, struct, re, time, traceback, hashlib
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-MCP_VERSION = "2.0.0"
+MCP_VERSION = "2.1.0"
 import uuid as _uuid
 _CLIENT_INSTANCE = _uuid.uuid4().hex
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -35,6 +35,7 @@ MCP_SUPPORTED_PROTOCOLS = (
     "2025-11-25",
 )
 
+LUA_MAX_BYTES = 64 * 1024
 CLIENTLUA_MAX_BYTES = 64 * 1024
 CLIENTLUA_ACK_TIMEOUT = 15
 CLIENTLUA_MAX_RECIPIENTS = 128
@@ -45,6 +46,14 @@ DEPLOY_BATCH_MAX_INPUT_BYTES = 256 * 1024 * 1024
 GREP_MAX_PATTERNS = 20
 GREP_MAX_GLOBS = 50
 GREP_MAX_PATHS = 25
+# Default output budgets are sized for agents that call tools many times per
+# session; callers can still ask for up to OUTPUT_MAX_BYTES.
+CONSOLE_DEFAULT_MAXBYTES = 8000
+FETCH_DEFAULT_MAXBYTES = 12000
+GREP_DEFAULT_MAX = 50
+DB_DEFAULT_MAXBYTES = 12000
+OUTPUT_MAX_BYTES = 200000
+FILE_LINE_MAX_CHARS = 2000
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_KEEP = 3
 
@@ -202,6 +211,7 @@ DIFF_FILE_MAX_BYTES = @DIFF_FILE_MAX_BYTES@
 DIFF_BATCH_MAX_INPUT_BYTES = @DIFF_BATCH_MAX_INPUT_BYTES@
 DEPLOY_FILE_MAX_BYTES = @DEPLOY_FILE_MAX_BYTES@
 DEPLOY_BATCH_MAX_INPUT_BYTES = @DEPLOY_BATCH_MAX_INPUT_BYTES@
+FILE_LINE_MAX_CHARS = @FILE_LINE_MAX_CHARS@              # longer (minified) lines are cut in numbered reads
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")             # SGR/color escapes (console.log noise)
 
 def jout(o):
@@ -371,7 +381,7 @@ def op_console(req):
     # bytes), then byte-cap what the client actually has to read. Keep the
     # most-recent (end) slice, same policy as op_fetch.
     out = _ANSI_RE.sub("", out)
-    maxb = max(1, min(int(req.get("maxbytes", 24000)), 200000))
+    maxb = max(1, min(int(req.get("maxbytes", 8000)), 200000))
     orig = len(out)
     truncated = orig > maxb
     if truncated:
@@ -626,25 +636,27 @@ def op_fetch(req):
         if pat:
             out = "\n".join(l for l in out.splitlines() if pat in l)
         out = _ANSI_RE.sub("", out)
-        maxb = max(1, min(int(req.get("maxbytes", 48000)), 200000))
+        maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
         orig = len(out)
         truncated = orig > maxb
         if truncated:
             out = "...[truncated: last %d of %d chars]...\n%s" % (maxb, orig, out[orig - maxb:])
-        return {"ok": True, "path": "docker logs %s (tail %d)" % (u[:8], n),
+        return {"ok": True, "path": "docker logs (tail %d)" % n,
                 "content": out, "truncated": truncated}
 
+    # Results name files relative to garrysmod/: host paths embed the volume UUID.
     if what == "console":
         p = gm + "/console.log"
+        shown = "console.log"
     elif what == "file":
-        rel = req.get("path", "")
-        p = _safe_under(gm, rel)
+        shown = str(req.get("path") or "").lstrip("/")
+        p = _safe_under(gm, shown)
         if not p:
             return {"ok": False, "error": "path escapes volume"}
     else:
         return {"ok": False, "error": "unknown what: %s" % what}
     if not os.path.isfile(p):
-        return {"ok": False, "exists": False, "error": "no such file: %s" % p}
+        return {"ok": False, "exists": False, "error": "no such file: garrysmod/%s" % shown}
     if what == "file" and req.get("b64"):
         # binary-safe download: raw bytes as base64 (the client saves them locally;
         # the payload never reaches the model). Hard size cap.
@@ -660,17 +672,13 @@ def op_fetch(req):
         except OSError as e:
             return {"ok": False, "error": str(e)}
         import hashlib
-        return {"ok": True, "path": p, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+        return {"ok": True, "path": "garrysmod/" + shown, "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
                 "content_b64": base64.b64encode(data).decode()}
-    source_sha256 = None
+    if what == "file":
+        return _read_text_file(p, shown, req)
     try:
         with open(p, "rb") as f:
-            if what == "file":
-                import hashlib
-                h = hashlib.sha256()
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-                source_sha256 = h.hexdigest()
             f.seek(0, 2)
             size = f.tell()
             block = min(size, lines * 400 + 8192)
@@ -689,7 +697,7 @@ def op_fetch(req):
     # window holds <= `lines` newlines (long / minified / JSON lines, or a run of
     # long log lines) the whole block comes back (tens of KB) instead of ~N short
     # lines -> the occasional over-return. Keep the most-recent (end) slice.
-    maxb = max(1, min(int(req.get("maxbytes", 48000)), 200000))
+    maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
     orig = len(tail)
     truncated = orig > maxb
     if truncated:
@@ -698,8 +706,107 @@ def op_fetch(req):
         if 0 <= nl < 240:
             tail = tail[nl + 1:]
         tail = "...[truncated: last %d of %d chars]...\n%s" % (len(tail), orig, tail)
-    return {"ok": True, "path": p, "content": tail, "size": size,
-            "truncated": truncated, "bytes": len(tail), "sha256": source_sha256}
+    return {"ok": True, "path": "garrysmod/" + shown, "content": tail, "size": size,
+            "truncated": truncated, "bytes": len(tail), "sha256": None}
+
+def _file_lines(f, h=None, needle=None):
+    """Scan every byte with bounded line storage, including cross-block matches.
+    Yield (line number, display prefix, full byte length, matched)."""
+    keep = FILE_LINE_MAX_CHARS * 4 + 4
+    prefix = overlap = b""
+    full_len = 0
+    matched = needle is None
+    n = 0
+    for block in iter(lambda: f.read(1 << 20), b""):
+        if h is not None:
+            h.update(block)
+        parts = block.split(b"\n")
+        for i, part in enumerate(parts):
+            full_len += len(part)
+            prefix += part[:max(0, keep - len(prefix))]
+            if not matched:
+                candidate = overlap + part
+                matched = needle in candidate
+                overlap = candidate[-(len(needle) - 1):] if len(needle) > 1 else b""
+            if i < len(parts) - 1:
+                n += 1
+                yield n, prefix, full_len, matched
+                prefix = overlap = b""
+                full_len = 0
+                matched = needle is None
+    if full_len:
+        yield n + 1, prefix, full_len, matched
+
+def _read_text_file(p, shown, req):
+    """Numbered read of a whole text file. One pass yields the full SHA-256 and the
+    exact line count, plus either the offset/lines window or whole-file grep matches
+    (negative offset = from the end, which takes a second pass). Never a silent tail."""
+    import hashlib
+    try:
+        offset = max(-100000, int(req.get("offset") or 1)) or 1
+        limit = max(1, min(int(req.get("lines", 200)), 5000))
+        maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "offset, lines and maxbytes must be integers"}
+    pat = req.get("grep") or ""
+    needle = pat.encode("utf-8") if pat else None
+    h = hashlib.sha256()
+    total = matches = in_scope = 0
+    picked = []
+
+    def consider(n, raw, full_len, matched):
+        nonlocal in_scope
+        if n >= start and matched:
+            in_scope += 1
+            if len(picked) < limit:
+                picked.append((n, raw, full_len))
+
+    try:
+        with open(p, "rb") as f:
+            binary = b"\x00" in f.read(8192)
+            f.seek(0)
+            if binary:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+                return {"ok": True, "path": "garrysmod/" + shown, "size": f.tell(),
+                        "sha256": h.hexdigest(), "binary": True, "content": "", "shown": 0}
+            start = offset if offset > 0 else float("inf")
+            for n, raw, full_len, matched in _file_lines(f, h, needle):
+                total = n
+                if needle is not None and matched:
+                    matches += 1
+                consider(n, raw, full_len, matched)
+            size = f.tell()
+            if offset < 0:
+                start = max(1, total + offset + 1)
+                f.seek(0)
+                for n, raw, full_len, matched in _file_lines(f, needle=needle):
+                    consider(n, raw, full_len, matched)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    out, used, last, cut = [], 0, None, 0
+    for n, raw, full_len in picked:
+        text = _ANSI_RE.sub("", raw.decode("utf-8", "replace").rstrip("\r"))
+        cut_line = full_len > len(raw) or len(text) > FILE_LINE_MAX_CHARS
+        if cut_line:
+            text = text[:FILE_LINE_MAX_CHARS]
+            text += "...<+%d bytes>" % max(0, full_len - len(text.encode("utf-8")))
+        line = "%d\t%s" % (n, text)
+        cost = len(line.encode("utf-8")) + 1
+        if used + cost > maxb:
+            if not out:
+                return {"ok": False, "error": "maxbytes is too small for line %d; raise maxbytes to at least %d or use save_to" % (n, cost)}
+            break
+        out.append(line)
+        used += cost
+        cut += cut_line
+        last = n
+    return {"ok": True, "path": "garrysmod/" + shown, "size": size, "sha256": h.hexdigest(),
+            "binary": False, "total_lines": total, "start": start, "grep": needle is not None,
+            "matches": matches, "in_scope": in_scope, "shown": len(out),
+            "first": picked[0][0] if out else None, "last": last,
+            "more": len(out) < in_scope, "byte_capped": len(out) < len(picked),
+            "cut_lines": cut, "content": "\n".join(out)}
 
 def _safe_under(gm, rel):
     """Resolve a path beneath root without prefix-collision or symlink escapes."""
@@ -905,36 +1012,89 @@ def _restore_path(root, u, to, backup_id):
         raise ValueError("requested backup does not exist")
     return path
 
+def _history_load(history, ident):
+    """One deployment's receipts by phase (prepared, then result or rejected)."""
+    recs = {}
+    for phase in ("prepared", "result", "rejected"):
+        try:
+            with open(os.path.join(history, "%s.%s.json" % (ident, phase)), encoding="utf-8") as f:
+                recs[phase] = json.load(f)
+        except FileNotFoundError:
+            pass
+    return recs
+
+def _history_entry(ident, recs, prefix):
+    """(summary, matching file records, main receipt) with the phases merged."""
+    main = recs.get("result") or recs.get("rejected") or recs.get("prepared") or {}
+    files = [e for e in main.get("files") or [] if str(e.get("to", "")).startswith(prefix)]
+    if "result" in recs:
+        outcome = main.get("outcome") or ("complete" if main.get("ok") else "partial_or_uncertain")
+    elif "rejected" in recs:
+        outcome = "rejected"
+    else:
+        outcome = "uncertain"          # prepared without a result: interrupted
+    counts = {"new": 0, "replaced": 0, "unchanged": 0, "failed": 0, "unconfirmed": 0}
+    changed_bytes = 0
+    for e in files if outcome != "rejected" else ():
+        if e.get("ok") is False:
+            counts["failed"] += 1
+        elif e.get("ok") is not True:
+            counts["unconfirmed"] += 1
+        elif e.get("noop") or e.get("before_sha256") == e.get("after_sha256"):
+            counts["unchanged"] += 1
+        else:
+            counts["new" if e.get("before_sha256") == "missing" else "replaced"] += 1
+            changed_bytes += int(e.get("bytes") or 0)
+    summary = {"deployment_id": ident, "time_ns": main.get("time_ns"),
+               "operation": main.get("operation"), "outcome": outcome, "files": len(files),
+               "counts": counts, "bytes": changed_bytes,
+               "first": files[0].get("to") if files else None,
+               "error": str(main.get("error") or "")[:200],
+               "conflicts": len(main.get("conflicts") or [])}
+    return summary, files, main
+
 def _deployment_history(req):
+    """One summary per deployment, newest first; deployment_id pages one's files."""
     root = _guard_root(req["uuid"])
     history = os.path.join(root, "history")
     prefix = req.get("path") or ""
+    ident = req.get("deployment_id")
+    if ident:
+        ident = str(ident)
+        if not re.fullmatch(r"[0-9]{20}-[0-9a-f]{16}", ident):
+            return {"ok": False, "error": "deployment_id must be an id from the history list"}
+        recs = _history_load(history, ident)
+        if not recs:
+            return {"ok": False, "error": "no such deployment: %s" % ident}
+        summary, files, main = _history_entry(ident, recs, prefix)
+        offset = max(1, int(req.get("offset") or 1))
+        limit = max(1, min(int(req.get("lines", 50)), 200))
+        fields = ("to", "ok", "noop", "error", "expected_sha256", "before_sha256",
+                  "after_sha256", "restore_from", "source_path")
+        return {"ok": True, "summary": summary, "origin": main.get("origin") or {},
+                "conflicts": (main.get("conflicts") or [])[:20],
+                "offset": offset, "total_files": len(files),
+                "files": [{k: e[k] for k in fields if k in e}
+                          for e in files[offset - 1:offset - 1 + limit]]}
     limit = max(1, min(int(req.get("lines", 20)), 100))
-    before = req.get("before") or "~"
-    records = []
+    # Cursors are deployment ids; clients before 2.1 sent a receipt file name.
+    before = str(req.get("before") or "~").split(".", 1)[0]
     try:
-        names = sorted(os.listdir(history), reverse=True)
+        names = os.listdir(history)
     except FileNotFoundError:
         names = []
-    used = 0
-    cursor = None
-    for name in names:
-        if not name.endswith(".json") or name >= before:
-            continue
-        with open(os.path.join(history, name), encoding="utf-8") as f:
-            record = json.load(f)
-        if prefix:
-            record["files"] = [e for e in record.get("files", []) if e.get("to", "").startswith(prefix)]
-            if not record["files"]:
-                continue
-        size = len(json.dumps(record))
-        if records and (len(records) >= limit or used + size > 180000):
+    idents = sorted({n.split(".", 1)[0] for n in names if n.endswith(".json")}, reverse=True)
+    out, cursor = [], None
+    for scanned, ident in enumerate(i for i in idents if i < before):
+        if len(out) >= limit or scanned >= 2000:
             break
-        records.append(record)
-        used += size
-        cursor = name
-    return {"ok": True, "history": records, "before": cursor,
-            "note": "prepared without a result means interrupted or uncertain; inspect live hashes before retrying"}
+        cursor = ident
+        summary, files, _ = _history_entry(ident, _history_load(history, ident), prefix)
+        if files or not prefix:
+            out.append(summary)
+    else:
+        cursor = None                  # nothing older remains
+    return {"ok": True, "history": out, "before": cursor}
 
 def op_deploy(req):
     import hashlib, uuid
@@ -1083,8 +1243,22 @@ def op_grep(req):
         if not os.path.exists(base):
             return {"ok": False, "error": "no such path: %s" % rel}
         bases.append(base)
-    mx = max(1, min(int(req.get("max", 200)), 2000))
-    cmd = ["grep", "-rnI"]
+    mode = req.get("output") or "lines"
+    flag = {"basic": "-G", "extended": "-E", "fixed": "-F", "perl": "-P"}.get(req.get("regex") or "basic")
+    if mode not in ("lines", "files") or flag is None:
+        return {"ok": False, "error": "output must be lines|files and regex basic|extended|fixed|perl"}
+    try:
+        mx = max(1, min(int(req.get("max", 50)), 2000))
+        ctx = max(0, min(int(req.get("context", 0)), 10)) if mode == "lines" else 0
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "max and context must be integers"}
+    # -H names the file even for a single file operand; -Z ends the name with NUL,
+    # so names or text containing ':' or '-' parse unambiguously.
+    cmd = ["grep", "-rIHZ", flag, "-l" if mode == "files" else "-n"]
+    if req.get("ignore_case"):
+        cmd.append("-i")
+    if ctx:
+        cmd += ["-C", str(ctx)]
     for glob in globs:
         cmd += ["--include", glob]
     for glob in exclude_globs:
@@ -1110,9 +1284,12 @@ def op_grep(req):
             g.wait(timeout=3)
         except subprocess.TimeoutExpired:
             g.kill(); g.wait()
-        err = g.stderr.read().decode("utf-8", "replace")[-500:]
+        with g.stderr:
+            err = g.stderr.read().decode("utf-8", "replace")[-500:]
         if not byte_capped and g.returncode not in (0, 1):
             return {"ok": False, "error": "grep rc=%s: %s" % (g.returncode, err)}
+        if byte_capped:                    # drop the record the cap cut in half
+            raw = raw[:raw.rfind(b"\0" if mode == "files" else b"\n") + 1]
         out = raw.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         for p in (h, g):
@@ -1124,26 +1301,58 @@ def op_grep(req):
             if p is not None and p.poll() is None:
                 p.kill()
         return {"ok": False, "error": "grep failed: %s" % e}
-    lines = out.splitlines()
-    total = len(lines)
     pref = os.path.realpath(gm) + os.sep
-    # Cap each line (a match inside a minified/packed line would otherwise return
-    # the WHOLE line) and the total payload, so one grep can't flood the client.
-    shown, used, capped = [], 0, False
-    for l in lines[:mx]:
-        l = l.replace(pref, "")
-        if len(l) > 300:
-            l = l[:300] + "...<+%d chars>" % (len(l) - 300)
-        if used + len(l) + 1 > 40000:
+    def rel(path):
+        return path[len(pref):] if path.startswith(pref) else path
+    if mode == "files":
+        names = [rel(n) for n in out.split("\0") if n]
+        shown, used = [], 0
+        for name in names[:mx]:
+            if used + len(name) + 1 > 40000:
+                break
+            used += len(name) + 1
+            shown.append(name)
+        return {"ok": True, "output": "files", "paths": shown, "total": len(names),
+                "shown": len(shown), "total_exact": not byte_capped,
+                "truncated": byte_capped or len(shown) < len(names)}
+    # Group by file: the path once, then [line, ':' match or '-' context, text].
+    # Each text is stripped and capped (a match inside a minified line would
+    # otherwise return the whole line), and the payload is budgeted.
+    groups, index = [], {}
+    total = shown = used = 0
+    capped = False
+    last = None                           # (file, line) of the last shown match
+    for record in out.split("\n"):
+        name, nul, rest = record.partition("\0")
+        m = re.match(r"(\d+)([:-])(.*)", rest, re.S) if nul else None
+        if not m:
+            continue                      # blank, or a '--' context-group separator
+        n, is_match = int(m.group(1)), m.group(2) == ":"
+        name = rel(name)
+        total += is_match
+        if capped or (shown >= mx and (is_match or not last or last[0] != name
+                                       or not 0 < n - last[1] <= ctx)):
+            continue                      # past the cap; keep counting matches
+        text = m.group(3).strip()
+        if len(text) > 300:
+            text = text[:300] + "...<+%d chars>" % (len(text) - 300)
+        cost = len(text) + 8 + (0 if name in index else len(name) + 1)
+        if used + cost > 40000:
             capped = True
-            break
-        used += len(l) + 1
-        shown.append(l)
-    capped = capped or byte_capped or total > mx
-    r = {"ok": True, "matches": shown, "total": total, "shown": len(shown),
-         "total_exact": not byte_capped, "truncated": capped}
-    if capped:
-        r["note"] = "capture-capped; narrow paths/globs/patterns for a complete result"
+            continue
+        used += cost
+        if name not in index:
+            index[name] = len(groups)
+            groups.append([name, []])
+        groups[index[name]][1].append([n, m.group(2), text])
+        if is_match:
+            shown += 1
+            last = (name, n)
+    truncated = capped or byte_capped or total > shown
+    r = {"ok": True, "output": "lines", "groups": groups, "total": total, "shown": shown,
+         "total_exact": not byte_capped, "truncated": truncated}
+    if truncated:
+        r["note"] = "capture-capped; narrow paths/globs/patterns or raise max"
     return r
 
 def _diff_one(req, diff_cap=40000, batch=False):
@@ -1222,7 +1431,7 @@ def op_diff(req):
     if len(files) > 200:
         return {"ok": False, "error": "batch has %d files (max 200)" % len(files)}
     try:
-        maxbytes = max(0, min(int(req.get("maxbytes", 48000)), 200000))
+        maxbytes = max(0, min(int(req.get("maxbytes", 16000)), 200000))
     except (TypeError, ValueError):
         return {"ok": False, "error": "maxbytes must be an integer"}
     # Preflight every side before reading/diffing so a 200-file request cannot turn
@@ -1732,6 +1941,13 @@ def op_monitor(req):
     if not d:
         return {"ok": False, "error": "no such monitor %s (verdicts GC after 24h)" % mid}
     d["elapsed"] = round(time.time() - d.get("armed", time.time()), 1)
+    if d.get("mode") == "pattern":
+        # Number matches by arrival and return only those after the caller's
+        # cursor; count the unseen ones the 50-match ring already dropped.
+        ring = d.get("matches") or []
+        first = int(d.get("match_count", 0)) - len(ring) + 1
+        d["matches"] = [[seq, t, line] for seq, (t, line) in enumerate(ring, first) if seq > after]
+        d["evicted"] = max(0, first - 1 - after)
     return {"ok": True, "watch": d, "id": mid}
 
 def _mariadb_cid():
@@ -1767,7 +1983,7 @@ def op_db(req):
         return {"ok": False, "error": "db exec failed: %s" % e}
     out = r.stdout.decode("utf-8", "replace")
     err = r.stderr.decode("utf-8", "replace")
-    maxb = int(req.get("maxbytes", 40000))
+    maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
     truncated = len(out) > maxb
     if truncated:
         out = out[:maxb]
@@ -1815,7 +2031,7 @@ def op_mongo(req):
         return {"ok": False, "error": "mongo exec failed: %s" % e}
     out = r.stdout.decode("utf-8", "replace")
     err = r.stderr.decode("utf-8", "replace")
-    maxb = int(req.get("maxbytes", 40000))
+    maxb = max(1, min(int(req.get("maxbytes", 12000)), 200000))
     truncated = len(out) > maxb
     if truncated:
         out = out[:maxb]
@@ -1886,6 +2102,7 @@ def _render_driver(tmpl):
              .replace("@DIFF_BATCH_MAX_INPUT_BYTES@", str(DIFF_BATCH_MAX_INPUT_BYTES))
              .replace("@DEPLOY_FILE_MAX_BYTES@", str(DEPLOY_FILE_MAX_BYTES))
              .replace("@DEPLOY_BATCH_MAX_INPUT_BYTES@", str(DEPLOY_BATCH_MAX_INPUT_BYTES))
+             .replace("@FILE_LINE_MAX_CHARS@", str(FILE_LINE_MAX_CHARS))
              .replace("@SERVERS_JSON@", json.dumps(CFG["servers"])))
 
 
@@ -2226,7 +2443,7 @@ def tool_console(args):
             return (blocked, True)
     res = run_driver({"op": "console", "uuid": srv["uuid"], "cmd": command,
                       "grep": args.get("grep"),
-                      "maxbytes": int(args.get("maxbytes", 24000))}, timeout=45)
+                      "maxbytes": int(args.get("maxbytes", CONSOLE_DEFAULT_MAXBYTES))}, timeout=45)
     log_event({"ev": "console", "server": server, "cmd": command,
                "confirm": bool(args.get("confirm")), "ok": res.get("ok")})
     if not res.get("ok"):
@@ -2237,7 +2454,7 @@ def tool_console(args):
     if res.get("truncated"):
         head += "  [byte-capped -> most recent; raise maxbytes or narrow with grep]"
     if note:
-        head += "\n(note: %s)" % note
+        head += _once("console-note:" + server, "\n(note: %s)" % note)
     src = "console.log delta" if res.get("condebug") else "pty capture"
     return (head + "\n--- %s ---\n" % src + out, False)
 
@@ -2434,8 +2651,8 @@ local function _finalize(kind)
 end
 _scratch.MCP_DONE = function() _finalize("DON") end
 
--- sandbox env: body global READS fall through to _G; body global WRITES go to a
--- scratch table => zero _G pollution from the body's own globals (no cleanup needed).
+-- Plain global assignments go to a scratch table. Reads fall through to _G;
+-- shared tables and engine APIs remain accessible, so this is not a security sandbox.
 -- capture body print/Msg/MsgN as framed OUT lines (clean separation from other
 -- players' live console spam, which the driver drops as unframed noise).
 _scratch.print = function(...) _scratch.LOG(...) end
@@ -2513,20 +2730,45 @@ def render_runner(tok, body_rel, want_async):
             .replace("@ASYNC@", "true" if want_async else "false"))
 
 
+def _lua_source(args, cap):
+    """Lua from exactly one of code (inline) or local (a UTF-8 file on this machine).
+    A local file lets an agent rerun a suite without re-sending it as output tokens."""
+    code, local = args.get("code"), args.get("local")
+    if isinstance(code, str) and not code.strip():
+        code = None
+    if (code is None) == (not local):
+        return None, "give exactly one of code (inline Lua) or local (path of a local Lua file)"
+    if code is not None:
+        return (code, None) if isinstance(code, str) else (None, "code must be a string")
+    if not isinstance(local, str):
+        return None, "local must be a file path"
+    data, err = _read_local_capped(local, cap)
+    if err:
+        return None, err
+    try:
+        code = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "local file is not valid UTF-8"
+    if not code.strip():
+        return None, "local file is empty"
+    return code, None
+
+
 def tool_lua(args):
     server = args.get("server")
-    code = args.get("code", "")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    if not code.strip():
-        return ("code is empty", True)
+    code, err = _lua_source(args, LUA_MAX_BYTES)
+    if err:
+        return (err, True)
+    code_size = len(code.encode("utf-8"))
+    if code_size > LUA_MAX_BYTES:
+        return ("Lua code too large: %d UTF-8 bytes (max %d)" % (code_size, LUA_MAX_BYTES), True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     if not srv["running"]:
         return ("%s is DOWN — cannot run Lua (the server process isn't running)." % server.upper(), True)
-    if len(code) > 64 * 1024:
-        return ("code too large (>64KB)", True)
     if "~|~" in code or "__MCP" in code:
         return ("code may not contain the reserved markers '~|~' or '__MCP'", True)
     reason, band = classify_lua(code)
@@ -2547,7 +2789,8 @@ def tool_lua(args):
                       "capture_timeout": 7, "async_timeout": atimeout},
                      timeout=(atimeout + 30 if want_async else 55))
     log_event({"ev": "lua", "server": server, "confirm": bool(args.get("confirm")),
-               "async": want_async, "ok": res.get("ok"), "code": code[:200]})
+               "async": want_async, "ok": res.get("ok"), "code": code[:200],
+               "source": "local" if args.get("local") else "inline"})
     if not res.get("ok"):
         return ("lua failed: %s" % res.get("error"), True)
 
@@ -2595,6 +2838,84 @@ def _fmt_mtime(ts):
         return "?"
 
 
+def _fmt_time_ns(ns):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ns) / 1e9))
+    except Exception:
+        return "?"
+
+
+def _history_line(s):
+    counts = ", ".join("%d %s" % (n, k) for k, n in (s.get("counts") or {}).items() if n)
+    parts = [s.get("deployment_id"), _fmt_time_ns(s.get("time_ns")),
+             "%s %s" % (s.get("operation") or "deploy", s.get("outcome")),
+             "%d file(s)%s" % (s.get("files", 0), (" (%s)" % counts) if counts else "")]
+    if s.get("bytes"):
+        parts.append("%d B" % s["bytes"])
+    if s.get("first"):
+        parts.append(s["first"] + (" +%d" % (s["files"] - 1) if s.get("files", 0) > 1 else ""))
+    if s.get("conflicts"):
+        parts.append("%d stale-base conflict(s)" % s["conflicts"])
+    if s.get("error"):
+        parts.append(s["error"][:120])
+    return "  ".join(parts)
+
+
+def _history_file_line(e, outcome):
+    src = e.get("source_path") or ""
+    src = "  src=%s" % src if src and src != "inline" and not src.startswith("backup:") else ""
+    if outcome == "rejected":
+        return "%s  expected %s%s" % (e.get("to"), str(e.get("expected_sha256"))[:16], src)
+    if e.get("ok") is None:
+        return "%s  UNCONFIRMED planned_sha256=%s%s" % (e.get("to"), e.get("after_sha256") or "?", src)
+    if e.get("ok") is False:
+        return "%s  FAILED: %s" % (e.get("to"), str(e.get("error") or "")[:200])
+    before, after = e.get("before_sha256"), e.get("after_sha256") or "?"
+    if e.get("noop") or before == after:
+        state = "unchanged"
+    elif before == "missing":
+        state = "new"
+    else:
+        state = "was %s" % str(before)[:16]
+    if e.get("restore_from"):
+        state += ", restored from %s" % e["restore_from"]
+    return "%s  %s  %s%s" % (e.get("to"), after, state, src)
+
+
+def _format_history(server, res):
+    """Deployment history: one line per deployment, or one deployment's files."""
+    if "summary" in res:
+        s = res["summary"]
+        out = ["[%s] deployment %s" % (server.upper(), _history_line(s))]
+        origin = " ".join("%s=%s" % (k, v) for k, v in sorted((res.get("origin") or {}).items()) if v)
+        if origin:
+            out.append("origin: " + origin)
+        for c in res.get("conflicts") or []:
+            out.append("conflict %s: expected=%s actual=%s" % (
+                c.get("to"), c.get("expected_sha256"), c.get("actual_sha256")))
+        if (s.get("counts") or {}).get("replaced"):
+            out.append("replaced files are restorable with backup_id=%s" % s["deployment_id"])
+        if s.get("outcome") in ("uncertain", "partial_or_uncertain"):
+            out.append("Receipt does not confirm every write or backup: inspect live hashes and backups before retrying.")
+        files, first = res.get("files") or [], res.get("offset", 1)
+        total = res.get("total_files", len(files))
+        if files:
+            out.append("files %d-%d of %d (path  sha256 after  state):" % (first, first + len(files) - 1, total))
+            out += [_history_file_line(e, s.get("outcome")) for e in files]
+            if first + len(files) - 1 < total:
+                out.append("next: offset=%d" % (first + len(files)))
+        return "\n".join(out)
+    items = res.get("history") or []
+    out = ["[%s] deployment history, newest first: %d shown%s" % (
+        server.upper(), len(items), "; per-file detail: deployment_id=<id>" if items else "")]
+    out += [_history_line(s) for s in items]
+    if res.get("before"):
+        out.append("next page: before=%s" % res["before"])
+    if any(s.get("outcome") in ("uncertain", "partial_or_uncertain") for s in items):
+        out.append("uncertain/partial deployments may have changed files: inspect live hashes before retrying.")
+    return "\n".join(out)
+
+
 def tool_fetch(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
@@ -2616,7 +2937,9 @@ def tool_fetch(args):
     if what in ("dir", "hash", "backups", "history"):
         req = {"op": "fetch", "uuid": srv["uuid"], "what": what, "path": args.get("path", "")}
         if what == "history":
-            req.update(lines=args.get("lines", 20), before=args.get("before"))
+            detail = args.get("deployment_id")
+            req.update(lines=args.get("lines", 50 if detail else 20), before=args.get("before"),
+                       deployment_id=detail, offset=args.get("offset", 1))
         if what == "hash" and args.get("glob"):
             req["glob"] = args["glob"]
         res = run_driver(req, timeout=90)
@@ -2624,7 +2947,7 @@ def tool_fetch(args):
         if not res.get("ok"):
             return ("fetch failed: %s" % res.get("error"), True)
         if what == "history":
-            return (json.dumps(res, ensure_ascii=False, indent=2), False)
+            return (_format_history(server, res), False)
         if what == "dir":
             ents = res.get("entries", [])
             out = ["[%s] dir garrysmod/%s — %d entries%s" % (
@@ -2632,9 +2955,9 @@ def tool_fetch(args):
                 " (showing first 500)" if res.get("truncated") else "")]
             for e in ents:
                 if e.get("dir"):
-                    out.append("  %-44s     <dir>" % (e["name"] + "/"))
+                    out.append(e["name"] + "/")
                 else:
-                    out.append("  %-44s %9s  %s" % (e["name"], e.get("size"), _fmt_mtime(e.get("mtime"))))
+                    out.append("%s  %s  %s" % (e["name"], e.get("size"), _fmt_mtime(e.get("mtime"))))
             return ("\n".join(out), False)
         if what == "hash":
             files = res.get("files", {})
@@ -2646,7 +2969,7 @@ def tool_fetch(args):
             used, omitted = 0, 0
             for rel in sorted(files):
                 h, sz = files[rel]
-                line = "  %s %9s  %s" % (h or "?" * 12, sz, rel)
+                line = "%s %s %s" % (h or "?", sz, rel)
                 if used + len(line) > 48000:
                     omitted += 1
                     continue
@@ -2658,23 +2981,25 @@ def tool_fetch(args):
             if res.get("skipped_escaped"):
                 out.append("  [%d symlink target(s) escaped garrysmod/ and were not read]" %
                            res["skipped_escaped"])
-            out.append("TIP: when several hashes differ, compare them in ONE srcds_diff files=[...] batch, not separate calls.")
+            tip = _once("hash-tip", "TIP: when several hashes differ, compare them in ONE srcds_diff files=[...] batch, not separate calls.")
+            if tip:
+                out.append(tip)
             return ("\n".join(out), False)
         baks = res.get("backups", [])
         out = ["[%s] deploy backups (restore requires expected_sha256 and explicit backup_id) — %d%s" % (
             server.upper(), len(baks), " (capped at 500)" if res.get("truncated") else "")]
         for b in baks:
-            out.append("  %s  %s  %9s  %s" % (b.get("backup_id", "legacy"), b["path"], b["size"], _fmt_mtime(b["mtime"])))
+            out.append("%s  %s  %s  %s" % (b.get("backup_id", "legacy"), b["path"], b["size"], _fmt_mtime(b["mtime"])))
         return ("\n".join(out), False)
 
+    if what == "file" and not save_to:
+        return _fetch_file_text(server, srv, args)
     req = {"op": "fetch", "uuid": srv["uuid"], "what": what,
            "lines": int(args.get("lines", 200))}
-    if args.get("maxbytes") is not None:
-        req["maxbytes"] = int(args["maxbytes"])
+    req["maxbytes"] = int(args.get("maxbytes", FETCH_DEFAULT_MAXBYTES))
     if what == "file":
         req["path"] = args.get("path", "")
-        if save_to:
-            req["b64"] = True
+        req["b64"] = True
     if args.get("grep"):
         req["grep"] = args["grep"]
     res = run_driver(req, timeout=(150 if save_to else 40))
@@ -2703,11 +3028,61 @@ def tool_fetch(args):
                 % (server.upper(), args.get("path", ""), save_to, len(data),
                    hashlib.sha256(data).hexdigest()), False)
     hdr = "[%s] %s (%s)" % (server.upper(), what, res.get("path", ""))
-    if res.get("sha256"):
-        hdr += "\nfull_file_sha256=" + res["sha256"] + " (text below may be filtered or tailed)"
     if res.get("truncated"):
         hdr += "  [byte-capped -> showing most recent; raise maxbytes or narrow via grep/lines for more]"
     return ("%s\n%s" % (hdr, res.get("content", "")), False)
+
+
+def _fetch_file_text(server, srv, args):
+    """Numbered file read: a window from line 1 (or offset), or whole-file grep hits."""
+    try:
+        req = {"op": "fetch", "uuid": srv["uuid"], "what": "file",
+               "path": args.get("path") or "", "offset": int(args.get("offset") or 1),
+               "lines": int(args.get("lines", 200)),
+               "maxbytes": int(args.get("maxbytes", FETCH_DEFAULT_MAXBYTES))}
+    except (TypeError, ValueError):
+        return ("offset, lines and maxbytes must be integers.", True)
+    if args.get("grep"):
+        req["grep"] = args["grep"]
+    res = run_driver(req, timeout=60)
+    log_event({"ev": "fetch", "server": server, "what": "file", "ok": res.get("ok"),
+               "more": res.get("more"), "grep": bool(req.get("grep"))})
+    if not res.get("ok"):
+        return ("fetch failed: %s" % res.get("error"), True)
+    return (_format_file_read(server, req, res), False)
+
+
+def _format_file_read(server, req, res):
+    head = "[%s] %s" % (server.upper(), res.get("path"))
+    sha = "full_file_sha256=%s" % res.get("sha256")
+    if res.get("binary"):
+        return "%s: binary file (%s bytes); download it with save_to.\n%s" % (head, res.get("size"), sha)
+    total, shown = res.get("total_lines", 0), res.get("shown", 0)
+    if res.get("grep"):
+        head += ": grep %s matched %d of %d lines" % (json.dumps(req.get("grep")), res.get("matches", 0), total)
+        if res.get("start", 1) > 1:
+            head += ", %d from line %d" % (res.get("in_scope", 0), res["start"])
+        if shown:
+            head += "; showing %d" % shown
+    elif shown:
+        head += ": lines %d-%d of %d" % (res["first"], res["last"], total)
+    else:
+        head += ": no lines from offset %d (file has %d lines)" % (req["offset"], total)
+    head += " (%s bytes)" % res.get("size")
+    if res.get("more"):
+        head += "; next offset=%d" % (res["last"] + 1)
+    notes = []
+    if res.get("byte_capped"):
+        notes.append("byte cap reached: raise maxbytes or continue at the next offset")
+    if res.get("cut_lines"):
+        notes.append("%d long line(s) cut at %d chars: use save_to for exact bytes"
+                     % (res["cut_lines"], FILE_LINE_MAX_CHARS))
+    text = head + "\n" + sha
+    if notes:
+        text += "\n(" + "; ".join(notes) + ")"
+    if res.get("content"):
+        text += "\n" + res["content"]
+    return text
 
 
 PANEL_URL = CFG.get("panel_url") or ""
@@ -2715,7 +3090,7 @@ PANEL_URL = CFG.get("panel_url") or ""
 
 DEPLOY_BATCH_MAX = 400          # sanity cap; a whole addon fits comfortably
 DIFF_BATCH_MAX = 200
-DIFF_BATCH_DEFAULT_MAXBYTES = 48000
+DIFF_BATCH_DEFAULT_MAXBYTES = 16000
 DIFF_BATCH_MAXBYTES = 200000
 
 # Anti-trickle nudge: an LLM that uploads N files as N single-file calls burns a
@@ -2723,6 +3098,17 @@ DIFF_BATCH_MAXBYTES = 200000
 # server in a sliding window and, past the threshold, tell it to batch. Advisory
 # only — never blocks (re-deploying the SAME file repeatedly is a legit dev loop
 # and doesn't trip this, since distinct paths are what's counted).
+_ONCE_SHOWN = set()
+
+
+def _once(key, text):
+    """Standing guidance costs tokens on every call; say it once per process."""
+    if key in _ONCE_SHOWN:
+        return ""
+    _ONCE_SHOWN.add(key)
+    return text
+
+
 SINGLE_TRICKLE_WINDOW = 240.0   # seconds
 SINGLE_TRICKLE_AT = 3           # distinct files before the nudge fires
 _recent_singles = {}            # server -> {to: last_deploy_time}
@@ -2864,14 +3250,22 @@ def tool_deploy(args):
             msg += "\nInspect fetch what='history' and live hashes before retrying; files may already have changed."
         return (msg, True)
     results = res.get("results") or [res]
-    msg = "[%s] %s %d file(s), %d changed bytes; deployment_id=%s" % (
-        server.upper(), "restored" if restore else "deployed", len(results), res.get("bytes", 0), deploy_id)
-    for r in results:
-        msg += "\n%s: sha256=%s%s%s" % (r.get("to"), r.get("after_sha256"),
-               " (unchanged)" if r.get("noop") else "",
-               " backup_id=" + r["backup_id"] if r.get("backup_id") else "")
+    changed = [r for r in results if not r.get("noop")]
+    n_new = sum(1 for r in changed if r.get("before_sha256") == "missing")
+    counts = ", ".join("%d %s" % (n, k) for k, n in (
+        ("new", n_new), ("replaced", len(changed) - n_new), ("unchanged", len(results) - len(changed))) if n)
+    msg = "[%s] %s %d file(s) (%s), %d changed bytes; deployment_id=%s%s" % (
+        server.upper(), "restored" if restore else "deployed", len(results), counts,
+        res.get("bytes", 0), deploy_id, "; sha256 after:" if changed else "")
+    for r in changed:
+        msg += "\n%s  %s%s" % (r.get("to"), r.get("after_sha256"),
+                               "  new" if r.get("before_sha256") == "missing" else "")
+    if len(changed) > n_new:
+        msg += _once("deploy-backup", "\nReplaced files are backed up under backup_id=<deployment_id>.")
+    if len(changed) < len(results):
+        msg += _once("deploy-unchanged", "\nUnchanged files are not listed: their sha256 is the expected_sha256 you sent.")
     if any(e["to"].endswith(".lua") for e in entries):
-        msg += "\nSource bytes verified; runtime reload and client behavior still require verification."
+        msg += _once("deploy-lua", "\nSource bytes verified; runtime reload and client behavior still require verification.")
     return (msg, False)
 
 
@@ -2919,41 +3313,74 @@ def tool_grep(args):
         paths = [""]
     if any(not isinstance(p, str) for p in paths) or len(paths) > GREP_MAX_PATHS:
         return ("invalid paths[] (max %d string roots)." % GREP_MAX_PATHS, True)
+    output = args.get("output") or "lines"
+    regex = args.get("regex") or "basic"
+    if output not in ("lines", "files"):
+        return ("output must be 'lines' or 'files'.", True)
+    if regex not in ("basic", "extended", "fixed", "perl"):
+        return ("regex must be basic, extended, fixed or perl.", True)
+    try:
+        context = max(0, min(int(args.get("context", 0)), 10))
+        mx = int(args.get("max", GREP_DEFAULT_MAX))
+    except (TypeError, ValueError):
+        return ("context and max must be integers.", True)
     srv = resolve(server)
     if not srv:
         return ("could not resolve server '%s' (host unreachable?)" % server, True)
     res = run_driver({"op": "grep", "uuid": srv["uuid"], "patterns": patterns,
                       "paths": paths, "globs": globs, "exclude_globs": exclude_globs,
-                      "max": int(args.get("max", 200))}, timeout=40)
+                      "max": mx, "output": output, "regex": regex, "context": context,
+                      "ignore_case": bool(args.get("ignore_case"))}, timeout=40)
     log_event({"ev": "grep", "server": server, "pattern": "\n".join(patterns),
                "paths": len(paths), "globs": len(globs), "ok": res.get("ok")})
     if not res.get("ok"):
         return ("grep failed: %s" % res.get("error"), True)
+    return (_format_grep(server, res, context), False)
+
+
+def _format_grep(server, res, context):
+    """Matches grouped by file: the path once, then N:text (N-text for context)."""
     total, shown = res.get("total", 0), res.get("shown", 0)
     total_text = str(total) if res.get("total_exact", True) else (">=%d" % total)
-    head = "[%s] grep — %s captured match(es), %d pattern(s), %d include glob(s), %d root(s)%s" % (
-        server.upper(), total_text, len(patterns), len(globs), len(paths),
-        ("" if total <= shown and not res.get("truncated") else " (showing %d)" % shown))
+    if res.get("output") == "files":
+        paths = res.get("paths") or []
+        head = "[%s] grep: %s matching file(s)" % (server.upper(), total_text)
+        if res.get("truncated"):
+            head += ", showing %d (narrow the search or raise max)" % len(paths)
+        return head + "".join("\n" + p for p in paths)
+    groups = res.get("groups") or []
+    head = "[%s] grep: %s match(es)" % (server.upper(), total_text)
+    if groups:
+        head += ", showing %d in %d file(s)" % (shown, len(groups)) if res.get("truncated") \
+            else " in %d file(s)" % len(groups)
     if res.get("note"):
         head += "  [%s]" % res["note"]
-    matches = res.get("matches", [])
-    return (head + ("\n" + "\n".join(matches) if matches else ""), False)
+    out = [head]
+    for name, rows in groups:
+        out.append(name)
+        prev = None
+        for n, sep, text in rows:
+            if context and prev is not None and n != prev + 1:
+                out.append("--")
+            out.append("%d%s%s" % (n, sep, text))
+            prev = n
+    return "\n".join(out)
 
 
 def _format_diff_result(req, res):
-    head = "[diff] %s  vs  %s" % (req["label_a"], req["label_b"])
-    head += "\nsha256_a=%s sha256_b=%s\n" % (res.get("sha256_a"), res.get("sha256_b"))
+    head = "[diff] %s vs %s" % (req["label_a"], req["label_b"])
     if res.get("equal"):
-        return head + " — IDENTICAL (%s bytes, sha1 %s)" % (res.get("size_a"), res.get("sha_a"))
+        return "%s: IDENTICAL (%s bytes)\nsha256=%s" % (head, res.get("size_a"), res.get("sha256_a"))
+    sizes = "%s vs %s bytes" % (res.get("size_a"), res.get("size_b"))
+    hashes = "sha256_a=%s sha256_b=%s" % (res.get("sha256_a"), res.get("sha256_b"))
     if res.get("binary"):
-        return head + " — BINARY files DIFFER: %s vs %s bytes (sha1 %s vs %s)" % (
-            res.get("size_a"), res.get("size_b"), res.get("sha_a"), res.get("sha_b"))
+        return "%s: BINARY, DIFFER (%s)\n%s" % (head, sizes, hashes)
     cap = "  [truncated by output budget]" if res.get("truncated") else ""
     diff = res.get("diff", "")
-    if not diff:
-        diff = "[no textual diff rendered; sha1 %s vs %s]" % (res.get("sha_a"), res.get("sha_b"))
-    return head + " — DIFFER (%s vs %s bytes)%s\n%s" % (
-        res.get("size_a"), res.get("size_b"), cap, diff)
+    if diff.startswith("--- "):
+        # The header already names both sides; drop difflib's ---/+++ lines.
+        diff = diff.split("\n", 2)[2] if diff.count("\n") >= 2 else ""
+    return "%s: DIFFER (%s)%s\n%s\n%s" % (head, sizes, cap, hashes, diff or "[no textual diff rendered]")
 
 
 def _diff_local_entry(server, srv, path, local, context):
@@ -3035,29 +3462,27 @@ def _diff_batch(server, srv, args, files):
     if not res.get("ok"):
         return ("batch diff failed: %s" % res.get("error"), True)
     results = res.get("results") or []
-    n_equal = res.get("n_equal", 0)
-    n_differ = res.get("n_differ", 0)
-    n_fail = res.get("n_fail", 0)
-    msg = ("[batch diff] %s vs %s — %d files: %d IDENTICAL, %d DIFFER, %d FAILED; "
-           "one SSH round-trip" % (server, server_b or "local", len(entries), n_equal, n_differ, n_fail))
+    n_equal = n_differ = n_fail = 0
     details = []
     for i, entry in enumerate(entries):
-        if i >= len(results):
-            details.append("FAILED  %s  vs  %s — missing driver result" %
-                           (entry["label_a"], entry["label_b"]))
-            n_fail += 1
-            continue
-        item = results[i]
+        item = results[i] if i < len(results) else {"ok": False, "error": "missing driver result"}
         if not item.get("ok"):
-            details.append("FAILED  %s  vs  %s — %s" %
-                           (entry["label_a"], entry["label_b"], item.get("error")))
+            n_fail += 1
+            details.append("[diff] %s vs %s: FAILED: %s" % (entry["label_a"], entry["label_b"], item.get("error")))
+        elif item.get("equal"):
+            n_equal += 1                 # the caller knows which files it sent
         else:
+            n_differ += 1
             details.append(_format_diff_result(entry, item))
+    msg = "[batch diff] %s vs %s: %d files, %d identical, %d differ, %d failed" % (
+        server, server_b or "local", len(entries), n_equal, n_differ, n_fail)
+    if n_equal:
+        msg += _once("diff-identical", " (identical files are not listed; srcds_fetch what='hash' prints their SHA-256)")
     if details:
         msg += "\n\n" + "\n\n".join(details)
     if res.get("n_truncated"):
-        msg += "\n%d differing diff(s) were truncated to the %d-byte aggregate output budget." % (
-            res["n_truncated"], res.get("maxbytes", maxbytes))
+        msg += "\n%d differing diff(s) were cut to fit the %d-byte budget; raise maxbytes (max %d) or diff fewer files." % (
+            res["n_truncated"], res.get("maxbytes", maxbytes), DIFF_BATCH_MAXBYTES)
     _recent_diff_singles.pop((server, server_b or "local"), None)
     return (msg, n_fail > 0)
 
@@ -3357,9 +3782,9 @@ def tool_clientlua(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
-    code = args.get("code", "")
-    if not code.strip():
-        return ("code is empty", True)
+    code, err = _lua_source(args, CLIENTLUA_MAX_BYTES)
+    if err:
+        return (err, True)
     code_bytes = code.encode("utf-8")
     if len(code_bytes) > CLIENTLUA_MAX_BYTES:
         return ("clientlua code too large: %d UTF-8 bytes (max %d)" %
@@ -3401,7 +3826,8 @@ def tool_clientlua(args):
                       "runner": runner, "async": True,
                       "async_timeout": CLIENTLUA_ACK_TIMEOUT + 3}, timeout=60)
     log_event({"ev": "clientlua", "server": server, "target": target,
-               "bytes": len(code_bytes), "broadcast": target == "all", "ok": res.get("ok")})
+               "bytes": len(code_bytes), "broadcast": target == "all", "ok": res.get("ok"),
+               "source": "local" if args.get("local") else "inline"})
     if not res.get("ok"):
         return ("clientlua failed: %s" % res.get("error"), True)
     r = res.get("result") or {}
@@ -3455,7 +3881,8 @@ def tool_clientlua(args):
     if nfail:
         lines.append("Client-reported synchronous execution failed or timed out; no visual/player acceptance is implied.")
     else:
-        lines.append("All targeted clients acknowledged synchronous execution; visual/player acceptance remains separate.")
+        lines.append(_once("clientlua-accept", "All targeted clients acknowledged synchronous execution; "
+                                               "visual/player acceptance remains separate.") or "All targeted clients acknowledged.")
     return ("\n".join(lines), nfail > 0)
 
 
@@ -3567,8 +3994,8 @@ def tool_monitor(args):
             return ("arm failed: watcher process did not come up (python3/docker missing on host?)", True)
         what = ("console regex /%s/" % pattern) if watch == "pattern" else ("server going %s" % watch.upper())
         return ("[%s] monitor ARMED — id=%s, watching %s for %d min.\n"
-                "Poll: srcds_monitor {server:'%s', id:'%s', wait:50} — returns early on a hit. "
-                "Disarm: action:'stop'." % (server.upper(), mid, what, timeout_min, server, mid), False)
+                "Poll: srcds_monitor {server:'%s', id:'%s', wait:50} returns early on a hit; then pass "
+                "after:<last # seen> to get only newer matches. Disarm: action:'stop'." % (server.upper(), mid, what, timeout_min, server, mid), False)
     if action == "list":
         res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "list"}, timeout=30)
         log_event({"ev": "monitor_list", "server": server, "ok": res.get("ok")})
@@ -3595,8 +4022,9 @@ def tool_monitor(args):
     if action != "check":
         return ("action must be one of: arm, check, stop, list", True)
     wait = max(0, min(int(args.get("wait", 0)), 55))
+    after = max(0, int(args.get("after", 0)))
     res = run_driver({"op": "monitor", "uuid": srv["uuid"], "act": "check", "id": mid,
-                      "wait": wait, "after": int(args.get("after", 0))}, timeout=wait + 30)
+                      "wait": wait, "after": after}, timeout=wait + 30)
     log_event({"ev": "monitor_check", "server": server, "id": mid, "wait": wait, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("check failed: %s" % res.get("error"), True)
@@ -3607,13 +4035,18 @@ def tool_monitor(args):
                                                          (d.get("elapsed") or 0) / 60.0)]
     if mode == "pattern":
         mc = d.get("match_count", 0)
-        matches = d.get("matches") or []
+        new = d.get("matches") or []
+        evicted = d.get("evicted", 0)
         if mc:
-            lines[0] += "  matches=%d" % mc
-            if mc > 15:
-                lines.append("  (showing last 15 of %d — pass after:%d to await the next)" % (mc, mc))
-            for t, l in matches[-15:]:
-                lines.append("  [+%ss] %s" % (t, l))
+            lines[0] += "  matches=%d, %d new after #%d" % (mc, len(new) + evicted, after)
+        if evicted:
+            lines.append("  (%d unseen match(es) were evicted from the 50-match buffer)" % evicted)
+        shown = new[:15]
+        for seq, t, l in shown:
+            lines.append("  #%d [+%ss] %s" % (seq, t, l))
+        if shown:
+            more = len(new) - len(shown)
+            lines.append("  next check: after=%d%s" % (shown[-1][0], (" (%d more waiting)" % more) if more else ""))
     else:
         hist = d.get("history") or []
         if hist:
@@ -3636,6 +4069,14 @@ def tool_monitor(args):
 # Convenience aliases: a game name -> its main schema. Any real schema name also works.
 DB_ALIAS = CFG.get("db_aliases") or {}
 DB_READ_FIRST = {"select", "show", "describe", "desc", "explain", "use", "help", "checksum"}
+
+
+def _maxbytes(args, default):
+    """The caller's output budget clamped to 1..OUTPUT_MAX_BYTES, or None if not an integer."""
+    try:
+        return max(1, min(int(args.get("maxbytes", default)), OUTPUT_MAX_BYTES))
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_db(database):
@@ -3687,8 +4128,11 @@ def tool_db_query(args):
         return ("BLOCKED: this SQL is a WRITE/DDL (%s) against the LIVE game DB '%s' — it changes real "
                 "player/server data. Re-call with confirm=true to run it. Nothing was executed."
                 % (reason, database or "?"), True)
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
     res = run_driver({"op": "db", "sql": sql, "database": database,
-                      "format": args.get("format", "tsv"),
+                      "format": args.get("format", "tsv"), "maxbytes": maxb,
                       "read_only": reason is None}, timeout=60)
     log_event({"ev": "db_query", "database": database, "write": bool(reason),
                "confirm": bool(args.get("confirm")), "sql": sql[:200], "ok": res.get("ok")})
@@ -3698,7 +4142,7 @@ def tool_db_query(args):
     if res.get("error_out"):
         out += "\n[mysql] " + res["error_out"]
     if res.get("truncated"):
-        out += "\n... (output truncated — add a LIMIT or narrow the query)"
+        out += "\n... (output truncated: add a LIMIT, narrow the query, or raise maxbytes)"
     return ("[db:%s]\n%s" % (database or "(server default)", out), False)
 
 
@@ -3718,13 +4162,19 @@ def tool_db_schema(args):
         if not _db_name_ok(table):
             return ("invalid table name", True)
         sql = "DESCRIBE `%s`.`%s`; SHOW INDEX FROM `%s`.`%s`;" % (database, table, database, table)
-    res = run_driver({"op": "db", "sql": sql, "format": fmt,
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
+    res = run_driver({"op": "db", "sql": sql, "format": fmt, "maxbytes": maxb,
                       "read_only": True}, timeout=30)
     log_event({"ev": "db_schema", "database": database, "table": table, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("db schema failed: %s" % (res.get("error_out") or res.get("error")), True)
     what = ("databases" if not database else ("tables in %s" % database if not table else "%s.%s" % (database, table)))
-    return ("[db schema: %s]\n%s" % (what, res.get("output", "") or "(empty)"), False)
+    out = res.get("output", "") or "(empty)"
+    if res.get("truncated"):
+        out += "\n... (output truncated: raise maxbytes)"
+    return ("[db schema: %s]\n%s" % (what, out), False)
 
 
 # ----------------------------------------------------------------------------
@@ -3825,9 +4275,9 @@ def _mongo_db_ok(d):
     return bool(d) and all(c.isalnum() or c in "_-" for c in d)
 
 
-def _run_mongo(script, database=None, fmt="shell", timeout=75):
+def _run_mongo(script, database=None, fmt="shell", timeout=75, maxbytes=DB_DEFAULT_MAXBYTES):
     return run_driver({"op": "mongo", "script": script, "database": database,
-                       "format": fmt, "container": MONGO_CFG.get("container") or "",
+                       "format": fmt, "maxbytes": maxbytes, "container": MONGO_CFG.get("container") or "",
                        "auth_db": MONGO_CFG.get("auth_db") or "admin"}, timeout=timeout)
 
 
@@ -3837,7 +4287,7 @@ def _mongo_body(res):
     if res.get("error_out"):
         out += ("\n" if out else "") + "[mongosh] " + res["error_out"]
     if res.get("truncated"):
-        out += "\n... (output truncated — add .limit()/a projection, or narrow the query)"
+        out += "\n... (output truncated: add .limit() or a projection, narrow the query, or raise maxbytes)"
     return out
 
 
@@ -3866,7 +4316,10 @@ def tool_mongo_query(args):
         return ("BLOCKED: %s against the LIVE game Mongo DB '%s'. Arbitrary mongosh scripts require "
                 "confirm=true; use srcds_mongo_schema for unconfirmed structured inspection. Nothing was executed."
                 % (gate_reason, database or "?"), True)
-    res = _run_mongo(script, database, args.get("format", "shell"))
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
+    res = _run_mongo(script, database, args.get("format", "shell"), maxbytes=maxb)
     log_event({"ev": "mongo_query", "database": database, "write": bool(reason),
                "confirm": bool(args.get("confirm")), "script": script[:200], "ok": res.get("ok")})
     if not res.get("ok"):
@@ -3921,7 +4374,10 @@ def tool_mongo_schema(args):
     else:
         sample = max(1, min(int(args.get("sample", 25)), 200))
         script, what = _mongo_describe_js(coll, sample), "%s.%s" % (database, coll)
-    res = _run_mongo(script, database, "shell", timeout=60)
+    maxb = _maxbytes(args, DB_DEFAULT_MAXBYTES)
+    if maxb is None:
+        return ("maxbytes must be an integer.", True)
+    res = _run_mongo(script, database, "shell", timeout=60, maxbytes=maxb)
     log_event({"ev": "mongo_schema", "database": database, "collection": coll, "ok": res.get("ok")})
     if not res.get("ok"):
         return ("mongo schema failed: %s" % _mongo_err(res), True)
@@ -3972,17 +4428,18 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': read a file; what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
+        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': numbered lines from line 1 (page with offset/lines; grep searches the whole file); what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups", "docker"], "default": "console"},
-                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (docker max 2000)."},
+                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail lines (max 2000). file: lines or grep matches per read (max 5000). history: page size (20, max 100; with deployment_id, files per page: 50, max 200)."},
+                "offset": {"type": "integer", "default": 1, "description": "file: first line (1-based; with grep, the first line searched); negative counts from the end (-50 = last 50 lines). Replies name the next offset. history with deployment_id: first file."},
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
-                "grep": {"type": "string", "description": "Optional substring filter (console/file)."},
-                "maxbytes": {"type": "integer", "default": 48000, "description": "Byte cap on returned content (keeps the most-recent slice). ANSI color codes are always stripped."},
+                "grep": {"type": "string", "description": "Substring filter: file searches the whole file; console/docker filter the tailed lines."},
+                "maxbytes": {"type": "integer", "default": 12000, "description": "Byte cap on returned text (max 200000): logs keep the newest slice, files name the next offset. ANSI codes are stripped."},
                 "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
                 "overwrite": {"type": "boolean", "default": False, "description": "Allow save_to to replace an existing local file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required when save_to is used because that writes to the local filesystem."},
@@ -3999,7 +4456,7 @@ TOOLS = [
                 "server": SERVER_ENUM,
                 "command": {"type": "string", "description": "The console command, e.g. 'status' or 'ulx adduser ...'."},
                 "grep": {"type": "string", "description": "Optional substring filter on captured output."},
-                "maxbytes": {"type": "integer", "default": 24000, "description": "Byte cap on the returned console.log delta (keeps the most-recent slice)."},
+                "maxbytes": {"type": "integer", "default": 8000, "description": "Byte cap on the returned output (keeps the most recent slice; max 200000)."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for every command not on the explicit read-only allowlist."},
             },
             "required": ["server", "command"],
@@ -4023,11 +4480,13 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Server Lua / verification suite. e.g. 'return player.GetCount()' or a multi-line CHECK/EQ assertion suite. Use `return <expr>` or LOG(...) to get values back."},
+                "local": {"type": "string", "description": "Instead of code: a local UTF-8 Lua file (max 64 KiB), so a suite is rerun by path."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for every srcds_lua call."},
                 "async": {"type": "boolean", "default": False, "description": "True for suites using timers/coroutines/http; then call MCP_DONE() from the final callback."},
                 "async_timeout": {"type": "integer", "default": 20, "description": "Seconds to wait for MCP_DONE() when async=true (max ~30)."},
             },
-            "required": ["server", "code"],
+            "required": ["server"],
+            "anyOf": [{"required": ["code"]}, {"required": ["local"]}],
         },
     },
     {
@@ -4045,7 +4504,6 @@ TOOLS = [
                                     "properties": {"to": {"type": "string"}, "local": {"type": "string"}, "content": {"type": "string"}},
                                     "required": ["to"]}},
                 "restore": {"type": "boolean", "default": False, "description": "Roll back 'to' (or every files[].to) to its last deploy backup instead of writing new content (local/content ignored; the backup is kept)."},
-                "backup": {"type": "boolean", "default": True, "description": "Back up overwritten files to the out-of-tree backups root, not next to the file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true to actually write."},
             },
             "required": ["server"],
@@ -4053,14 +4511,14 @@ TOOLS = [
     },
     {
         "name": "srcds_grep",
-        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Singular fields remain compatible. Read-only, always allowed.",
+        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Output groups matches by file: the path once, then N:text (N-text for context). Read-only, always allowed.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
-                "pattern": {"type": "string", "description": "grep -e pattern (basic regex)."},
+                "pattern": {"type": "string", "description": "grep -e pattern, in the syntax set by regex (default basic)."},
                 "patterns": {"type": "array", "minItems": 1, "maxItems": 20,
-                             "items": {"type": "string"}, "description": "Multiple grep -e basic regexes; matches ANY pattern."},
+                             "items": {"type": "string"}, "description": "Multiple grep -e patterns; matches ANY pattern."},
                 "path": {"type": "string", "description": "Subdir under garrysmod/ to search (default whole volume), e.g. 'addons/rals'."},
                 "paths": {"type": "array", "minItems": 1, "maxItems": 25,
                           "items": {"type": "string"}, "description": "Search several garrysmod-relative roots in the same call."},
@@ -4069,7 +4527,13 @@ TOOLS = [
                           "items": {"type": "string"}, "description": "Multiple filename include globs (OR)."},
                 "exclude_globs": {"type": "array", "maxItems": 50,
                                   "items": {"type": "string"}, "description": "Filename globs to exclude."},
-                "max": {"type": "integer", "default": 200, "description": "Max matches to return."},
+                "max": {"type": "integer", "default": 50, "description": "Max matches (or files with output='files') to return, up to 2000; the total is still counted."},
+                "regex": {"type": "string", "enum": ["basic", "extended", "fixed", "perl"], "default": "basic",
+                          "description": "basic (grep -G), extended (-E: a|b + ?), fixed (-F) or perl (-P: \\d \\b)."},
+                "ignore_case": {"type": "boolean", "default": False, "description": "Case-insensitive matching (grep -i)."},
+                "context": {"type": "integer", "default": 0, "description": "Context lines around each match (0-10)."},
+                "output": {"type": "string", "enum": ["lines", "files"], "default": "lines",
+                           "description": "files: only matching file names (grep -l)."},
             },
             "required": ["server"],
             "anyOf": [{"required": ["pattern"]}, {"required": ["patterns"]}],
@@ -4091,7 +4555,7 @@ TOOLS = [
                                     "properties": {"path": {"type": "string"}, "path_b": {"type": "string"}, "local": {"type": "string"}},
                                     "required": ["path"]}},
                 "context": {"type": "integer", "default": 3, "description": "Diff context lines for every comparison (0-100)."},
-                "maxbytes": {"type": "integer", "default": 48000, "description": "BATCH mode aggregate unified-diff output budget in bytes (max 200000); every file is still accounted for in the status summary."},
+                "maxbytes": {"type": "integer", "default": 16000, "description": "BATCH mode aggregate unified-diff output budget in bytes (max 200000); every file is still accounted for in the status summary."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for local-file comparisons because local contents cross the SSH boundary; not needed server-to-server."},
             },
             "required": ["server"],
@@ -4116,12 +4580,14 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Clientside Lua to run on the target players."},
+                "local": {"type": "string", "description": "Instead of code: a local UTF-8 Lua file (max 64 KiB)."},
                 "target": {"type": "string", "description": "Required: 'all', exact SteamID, or exact 17-digit SteamID64. Nicknames are intentionally rejected."},
                 "broadcast": {"type": "boolean", "default": False, "description": "Required true when target='all'."},
                 "force": {"type": "boolean", "default": False, "description": "Required true when target='all', even if A2S reports quiet/unknown."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true (executes code on clients)."},
             },
-            "required": ["server", "code", "target"],
+            "required": ["server", "target"],
+            "anyOf": [{"required": ["code"]}, {"required": ["local"]}],
         },
     },
     {
@@ -4149,7 +4615,7 @@ TOOLS = [
                         "container console on ANY server (no -condebug needed); or watch:'down'/'up' fires on the "
                         "wings state transition — 'down' also captures the last 40 console lines at death (crash "
                         "forensics). Returns an id. CHECK: id + wait<=55 long-polls and returns early on a hit; "
-                        "pass after:<seen count> to await only NEW matches. action:'stop'+id disarms; no args "
+                        "pass after:<last # seen> to get only newer matches. action:'stop'+id disarms; no args "
                         "lists this server's monitors. Watchers auto-expire after timeout_min. The action field "
                         "can usually be omitted — it is inferred (pattern/watch=arm, id=check, neither=list)."),
         "inputSchema": {
@@ -4164,7 +4630,7 @@ TOOLS = [
                 "timeout_min": {"type": "integer", "default": 30, "description": "arm: watcher auto-expires after this many minutes (1-240)."},
                 "id": {"type": "string", "description": "check/stop: the monitor id returned by arm."},
                 "wait": {"type": "integer", "default": 0, "description": "check: long-poll up to this many seconds (<=55), returning early on a hit."},
-                "after": {"type": "integer", "default": 0, "description": "check (pattern): only return early when match_count EXCEEDS this — pass the count you already saw."},
+                "after": {"type": "integer", "default": 0, "description": "check (pattern): the last match # you saw. Only newer matches are returned, and a long poll returns early only when one arrives."},
             },
             "required": ["server"],
         },
@@ -4176,7 +4642,7 @@ TOOLS = [
                         "and MariaDB/MySQL executable comments require confirm=true. `database` accepts a raw schema "
                         "name OR any alias defined in db_aliases in config.json.%s Output is TSV by default "
                         "(token-lean; tabs/newlines in values are escaped); format='table' for a bordered "
-                        "human-readable table. Capped ~40KB — add LIMIT for big tables." % _ALIAS_TXT),
+                        "human-readable table. Output defaults to 12 KB (maxbytes up to 200000); add LIMIT for big tables." % _ALIAS_TXT),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4209,8 +4675,8 @@ TOOLS = [
                         "The script is evaluated like a mongosh "
                         "REPL line, so the last expression's value is printed: `db.mail.find({to:'765..'})"
                         ".limit(5)` works as-is; use print()/EJSON.stringify() for custom output. `database` "
-                        "accepts a raw db name OR an alias from mongo_aliases in config.json.%s Output capped "
-                        "~40KB — always .limit() big collections." % (_MONGO_NOTE_TXT, _MONGO_ALIAS_TXT)),
+                        "accepts a raw db name OR an alias from mongo_aliases in config.json.%s Output defaults "
+                        "to 12 KB (maxbytes up to 200000); always .limit() big collections." % (_MONGO_NOTE_TXT, _MONGO_ALIAS_TXT)),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4248,6 +4714,9 @@ _BACKUP_ID_SCHEMA = {"type": "string", "pattern": "^(?:[0-9]{20}-[0-9a-f]{16}|le
                      "description": "Restore source version from fetch history/backups; required for restore."}
 for _schema_tool in TOOLS:
     _props = _schema_tool["inputSchema"]["properties"]
+    if _schema_tool["name"] in ("srcds_db_query", "srcds_db_schema", "srcds_mongo_query", "srcds_mongo_schema"):
+        _props["maxbytes"] = {"type": "integer", "default": DB_DEFAULT_MAXBYTES,
+                              "description": "Output byte cap (max %d)." % OUTPUT_MAX_BYTES}
     if _schema_tool["name"] == "srcds_deploy":
         _schema_tool["description"] = ("Guarded file deployment. SINGLE: to + expected_sha256 + exactly one of local/content. "
             "BATCH: files=[{to,expected_sha256,local|content},...] in one call. Fresh target resolution, per-volume lock, "
@@ -4263,15 +4732,16 @@ for _schema_tool in TOOLS:
         _props["files"]["items"]["properties"].update(expected_sha256=dict(_EXPECTED_SCHEMA), backup_id=dict(_BACKUP_ID_SCHEMA))
         _props["files"]["items"]["required"] = ["to", "expected_sha256"]
         _props["restore"]["description"] = "Restore an explicit backup_id; requires current-file expected_sha256 and no local/content. The displaced current version is backed up."
-        _props["backup"].update(const=True, description="Versioned backups are mandatory. False is rejected.")
         _schema_tool["inputSchema"]["oneOf"] = [
             {"required": ["files"], "not": {"anyOf": [{"required": [k]} for k in ("to", "local", "content", "expected_sha256", "backup_id")]}},
             {"required": ["to", "expected_sha256"], "not": {"required": ["files"]}}]
     elif _schema_tool["name"] == "srcds_fetch":
         _props["what"]["enum"].append("history")
-        _props["before"] = {"type": "string", "description": "For history: opaque 'before' cursor returned by the previous page."}
+        _props["before"] = {"type": "string", "description": "For history: the 'before' cursor printed by the previous page."}
+        _props["deployment_id"] = {"type": "string", "pattern": "^[0-9]{20}-[0-9a-f]{16}$",
+                                   "description": "For history: this deployment's files with full hashes (page with offset/lines)."}
         _props["path"]["description"] += " For history/backups: optional relative path prefix filter."
-        _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' returns durable per-file deployment metadata (lines=page size, max 100; before=cursor). Backups list explicit backup_id values."
+        _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' lists deployments newest first, one line each (lines=page size, max 100; before=cursor); deployment_id shows one deployment's files. Backups list explicit backup_id values."
 
 DISPATCH = {
     "srcds_status": tool_status,

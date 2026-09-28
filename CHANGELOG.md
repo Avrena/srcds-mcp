@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.1.0 — Complete file reads, compact results for repeated calls
+
+Agents call these tools many times per session, and every result stays in
+their context. This release fixes reads that silently returned partial data
+and removes repeated content from the largest results.
+
+- **Complete, numbered file reads.** `srcds_fetch what="file"` returns numbered
+  lines from line 1, pages with `offset`/`lines` (a negative offset counts back
+  from the end), and states the range, the line count and the next offset. It
+  used to return the last 200 lines without saying so. `grep` searches the
+  whole file instead of that tail. Long lines are cut visibly and binary files
+  are summarized. Matches across read blocks and beyond 4 MiB on a single line
+  are included. File-read payload limits count UTF-8 bytes, including the first
+  line; insufficient budgets return a size hint instead of oversized output.
+- **Deployment history per deployment.** `what="history"` lists one line per
+  deployment (outcome, file counts, bytes, first path) instead of raw receipts
+  pretty-printed twice per deployment: after one 400-file deploy the first page
+  is 256 characters instead of 184 KB. `deployment_id` pages one deployment's
+  files with full hashes. Prepared-only receipts identify unconfirmed plans
+  without claiming completed writes or available backups.
+- **Monitor deltas.** `srcds_monitor` checks return only matches after `after`,
+  oldest first, with the cursor for the next check, and count unseen matches
+  that the 50-match buffer dropped.
+- **Compact diff and deploy results.** Batch diffs count identical files instead
+  of listing them (40 identical files: 149 characters instead of 14 KB) and drop
+  the SHA-1 values and difflib's `---`/`+++` lines. Deploy results list only
+  files whose hash changed.
+- **Grouped grep with options.** Matches are grouped by file: the path once,
+  then `N:text` (200 matches in one file: 13.8 KB instead of 32.4 KB). New
+  `regex` (basic/extended/fixed/perl), `ignore_case`, `context`, and
+  `output="files"`.
+- **Budgets sized for repeated calls.** Defaults: console 8 KB, fetch 12 KB,
+  grep 50 matches, batch diff 16 KB, DB/Mongo 12 KB (new `maxbytes`, up to
+  200000). Guidance that does not change between calls is printed once per
+  process.
+- **Local Lua sources.** `srcds_lua` and `srcds_clientlua` accept `local`, the
+  path of a local Lua file, instead of `code`. The server Lua limit is 64 KiB
+  of UTF-8 bytes for either form, checked before server discovery.
+- Results name paths relative to `garrysmod/` instead of host paths containing
+  the volume UUID. Listings drop fixed-width padding. The deploy schema no
+  longer lists the always-true `backup` flag; `backup=false` is still rejected.
+
+Output formats changed; reconnect MCP sessions after upgrading. To read the end
+of a file as before, pass a negative `offset`. The new options add about 2 KB
+to `tools/list`.
+
 ## 2.0.0 — Guarded deployments and durable history
 
 Deployment protocol v2 prevents an older working copy from silently overwriting
