@@ -24,7 +24,7 @@ and rotate beside the selected config file.
 import sys, os, json, base64, subprocess, socket, struct, re, time, traceback, hashlib
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-MCP_VERSION = "2.1.0"
+MCP_VERSION = "2.2.0"
 import uuid as _uuid
 _CLIENT_INSTANCE = _uuid.uuid4().hex
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -523,6 +523,36 @@ def op_fetch(req):
 
     if what == "history":
         return _deployment_history(req)
+
+    if what == "crashes":
+        base = _safe_under(gm, "holylib/crashes")
+        if not base:
+            return {"ok": False, "error": "crash directory escapes volume"}
+        name = req.get("path", "")
+        if name:
+            if not isinstance(name, str) or name in (".", "..") or any(c in name for c in ("/", "\\", "\x00", ":")):
+                return {"ok": False, "error": "crashes path must be one filename from the listing"}
+            path = _safe_under(gm, "holylib/crashes/" + name)
+            if not path or os.path.islink(os.path.join(base, name)) or not os.path.isfile(path):
+                return {"ok": False, "error": "crash log is missing or not a regular contained file"}
+            return _read_text_file(path, "holylib/crashes/" + name, req)
+        if not os.path.isdir(base):
+            return {"ok": True, "crashes": [], "total": 0, "truncated": False}
+        import heapq
+        entries = []
+        scanned = 0
+        with os.scandir(base) as it:
+            for entry in it:
+                scanned += 1
+                if scanned > 10000:
+                    break
+                if entry.is_file(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    entries.append({"name": entry.name, "size": st.st_size, "mtime": int(st.st_mtime)})
+        limit = max(1, min(int(req.get("lines", 20)), 100))
+        newest = heapq.nsmallest(limit, entries, key=lambda e: (-e["mtime"], e["name"]))
+        return {"ok": True, "crashes": newest, "total": len(entries),
+                "truncated": len(entries) > limit or scanned > 10000, "scan_limited": scanned > 10000}
 
     if what == "dir":
         base = _safe_under(gm, req.get("path", ""))
@@ -2403,6 +2433,12 @@ def tool_status(args):
         cap = "condebug" if s["condebug"] else "NO-condebug(blind)"
         lines.append("  %-6s  UP  %-22s  %-22s  port=%s  %s" % (
             tag, pc, live_s, s.get("port"), cap))
+        if args.get("diagnostics"):
+            result = _diagnostics_call(s, {"action": "capabilities"})
+            lines.append("    diagnostics: " + json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        if args.get("players"):
+            result = _diagnostics_call(s, {"action": "players", "limit": 50, "offset": 0})
+            lines.append("    players: " + json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     lines.append("")
     if LIVE_THRESHOLD:
         lines.append("Live thresholds: " + ", ".join(
@@ -2831,6 +2867,106 @@ def tool_lua(args):
     return ("\n".join(parts), is_error)
 
 
+def _diagnostics_call(srv, request):
+    """Run a fixed adapter operation. No arbitrary Lua is accepted by this API."""
+    if not srv.get("running"):
+        return {"ok": False, "error": "server is down; runtime diagnostics unavailable"}
+    try:
+        with open(os.path.join(_HERE, "srcds_diagnostics.lua"), encoding="utf-8") as f:
+            source = f.read(LUA_MAX_BYTES + 1)
+    except OSError:
+        return {"ok": False, "error": "srcds_diagnostics.lua is missing; install it beside srcds_mcp.py"}
+    request = dict(request, token=os.urandom(16).hex())
+    encoded = base64.b64encode(json.dumps(request).encode()).decode()
+    body = ("local adapter = (function()\n" + source + "\nend)()\n"
+            "local request = util.JSONToTable(util.Base64Decode('" + encoded + "'))\n"
+            "adapter(request, function(result)\n"
+            "  local data = util.TableToJSON(result)\n"
+            "  assert(data, 'diagnostic JSON encoding failed')\n"
+            "  if #data > 24000 then data = util.TableToJSON({ok=false,error='diagnostic result exceeds 24000 bytes; request fewer rows or paths'}) end\n"
+            "  local encoded = util.Base64Encode(data, true):gsub('%s+', '')\n"
+            "  for i=1,#encoded,1000 do print(encoded:sub(i,i+999)) end\n"
+            "  MCP_DONE()\nend)\n")
+    if len(body.encode("utf-8")) > LUA_MAX_BYTES:
+        return {"ok": False, "error": "diagnostic request exceeds Lua source budget; use fewer paths"}
+    asynchronous = request.get("action") == "profile"
+    wait = int(request.get("seconds", 1)) + 6
+    tok = os.urandom(8).hex()
+    result = run_driver({"op": "lua", "uuid": srv["uuid"], "token": tok,
+                         "body": body, "runner": render_runner(tok, "_mcp/%s_body.lua" % tok, asynchronous),
+                         "async": asynchronous, "async_timeout": wait, "capture_timeout": 5},
+                        timeout=wait + 30)
+    log_event({"ev": "diagnostics", "action": request["action"], "ok": result.get("ok")})
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error") or "diagnostic transport failed"}
+    framed = result.get("result") or {}
+    if not framed.get("started") or not framed.get("ended") or framed.get("err") is not None:
+        return {"ok": False, "error": framed.get("err") or framed.get("note") or "incomplete diagnostic result"}
+    try:
+        encoded = "".join((framed.get("out") or "").splitlines())
+        data = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("ok"), bool):
+            raise ValueError("invalid result")
+        return data
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return {"ok": False, "error": "invalid or truncated diagnostic JSON; outcome is unconfirmed"}
+
+
+def _refresh_paths(paths):
+    """Keep exact MOD paths so shadowing addons cannot change source selection."""
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 100:
+        return None, "paths must contain 1-100 garrysmod-relative Lua files"
+    for path in paths:
+        if (not isinstance(path, str) or len(path) > 1024 or _bad_deploy_to(path)
+                or any(c in path for c in ("\\", "\x00", ":"))
+                or any(p in ("", ".", "..") for p in path.split("/"))
+                or not path.endswith(".lua")
+                or not re.match(r"^(lua/|addons/[^/]+/lua/|gamemodes/[^/]+/)", path)):
+            return None, "invalid Lua refresh path; use an exact garrysmod-relative lua/addon/gamemode file"
+    paths = list(dict.fromkeys(paths))
+    if sum(len(json.dumps(p)) + 96 for p in paths) > 22000:
+        return None, "Lua refresh path list exceeds the response budget; use fewer paths"
+    return paths, None
+
+
+def tool_diagnostics(args):
+    server = args.get("server")
+    if server not in SERVER_NAMES:
+        return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
+    action = args.get("action", "capabilities")
+    if action not in ("capabilities", "players", "profile", "errors_start", "errors", "errors_stop", "refresh"):
+        return ("unknown diagnostic action", True)
+    if action in ("profile", "errors_start", "errors_stop", "refresh") and args.get("confirm") is not True:
+        return ("BLOCKED: %s requires confirm=true. Nothing was executed." % action, True)
+    req = {"action": action}
+    for key, default, low, high in (("limit", 20, 1, 50), ("offset", 0, 0, 511),
+                                   ("ttl", 600, 10, 3600), ("maxbytes", 12000, 4096, 24000)):
+        value = args.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            return ("%s must be an integer from %d to %d" % (key, low, high), True)
+        req[key] = value
+    seconds = args.get("seconds", 1)
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0.1 <= seconds <= 5:
+        return ("seconds must be a number from 0.1 to 5", True)
+    req["seconds"] = seconds
+    after = args.get("after")
+    if after is not None:
+        if not isinstance(after, str) or re.fullmatch(r"[0-9a-f]{32}:[0-9]{1,15}", after) is None:
+            return ("after must be an error cursor returned by this tool", True)
+        req["after"] = after
+    if action == "refresh":
+        paths, error = _refresh_paths(args.get("paths"))
+        if error:
+            return (error, True)
+        req["paths"] = paths
+    srv = resolve(server, fresh=True)
+    if not srv:
+        return ("could not resolve exactly one server", True)
+    result = _diagnostics_call(srv, req)
+    return ("[%s] %s\n%s" % (server.upper(), action,
+            json.dumps(result, ensure_ascii=False, separators=(",", ":"))), not result.get("ok", False))
+
+
 def _fmt_mtime(ts):
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
@@ -2933,6 +3069,24 @@ def tool_fetch(args):
         if args.get("confirm") is not True:
             return ("BLOCKED: save the remote file into the requested LOCAL path. Re-call with "
                     "confirm=true. No remote read or local write was performed.", True)
+
+    if what == "crashes":
+        req = {"op": "fetch", "uuid": srv["uuid"], "what": what,
+               "path": args.get("path", ""), "lines": args.get("lines", 20),
+               "offset": args.get("offset", 1), "maxbytes": args.get("maxbytes", FETCH_DEFAULT_MAXBYTES)}
+        res = run_driver(req, timeout=40)
+        if not res.get("ok"):
+            return ("crash fetch failed: " + str(res.get("error")), True)
+        if req["path"]:
+            req["path"] = "holylib/crashes/" + req["path"]
+            return (_format_file_read(server, req, res), False)
+        lines = ["[%s] HolyLib crash logs: %d%s" % (server.upper(), res.get("total", 0),
+                  " (listing limited)" if res.get("truncated") else "")]
+        for entry in res.get("crashes", []):
+            lines.append("%s  %s bytes  %s" % (entry["name"], entry["size"], _fmt_mtime(entry["mtime"])))
+        if res.get("scan_limited"):
+            lines.append("Directory scan limited to 10000 entries; newer files may be omitted.")
+        return ("\n".join(lines), False)
 
     if what in ("dir", "hash", "backups", "history"):
         req = {"op": "fetch", "uuid": srv["uuid"], "what": what, "path": args.get("path", "")}
@@ -3169,6 +3323,8 @@ def tool_deploy(args):
     server = args.get("server")
     if server not in SERVER_NAMES:
         return ("server must be one of: %s" % ", ".join(SERVER_NAMES), True)
+    if "refresh_lua" in args and not isinstance(args["refresh_lua"], bool):
+        return ("refresh_lua must be a boolean", True)
     batch = args.get("files") is not None
     if batch and any(k in args for k in ("to", "local", "content", "expected_sha256", "backup_id")):
         return ("give files OR top-level to/local/content/expected_sha256/backup_id, not both", True)
@@ -3266,6 +3422,17 @@ def tool_deploy(args):
         msg += _once("deploy-unchanged", "\nUnchanged files are not listed: their sha256 is the expected_sha256 you sent.")
     if any(e["to"].endswith(".lua") for e in entries):
         msg += _once("deploy-lua", "\nSource bytes verified; runtime reload and client behavior still require verification.")
+    if args.get("refresh_lua"):
+        paths = [r["to"] for r in changed if r.get("to", "").endswith(".lua")]
+        if paths:
+            paths, error = _refresh_paths(paths)
+            refreshed = ({"ok": False, "error": error} if error else
+                         _diagnostics_call(srv, {"action": "refresh", "paths": paths}))
+            msg += "\nLuaPack refresh (client execution unverified): " + json.dumps(refreshed, separators=(",", ":"))
+            if not refreshed.get("ok"):
+                msg += "\nFile deployment completed. Retry only the diagnostic refresh after resolving the error."
+        else:
+            msg += "\nLuaPack refresh: no changed Lua files."
     return (msg, False)
 
 
@@ -4743,6 +4910,37 @@ for _schema_tool in TOOLS:
         _props["path"]["description"] += " For history/backups: optional relative path prefix filter."
         _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' lists deployments newest first, one line each (lines=page size, max 100; before=cursor); deployment_id shows one deployment's files. Backups list explicit backup_id values."
 
+for _schema_tool in TOOLS:
+    _props = _schema_tool["inputSchema"]["properties"]
+    if _schema_tool["name"] == "srcds_status":
+        _props["diagnostics"] = {"type": "boolean", "description": "Query current HolyLib capabilities through Lua (adds latency)."}
+        _props["players"] = {"type": "boolean", "description": "Include up to 50 client network/signon records through Lua; paginate with srcds_diagnostics."}
+    elif _schema_tool["name"] == "srcds_fetch":
+        _props["what"]["enum"].append("crashes")
+        _props["path"]["description"] += " For crashes: omit to list, or use one returned filename to read it."
+        _schema_tool["description"] += " what='crashes' lists HolyLib crash logs newest first, also while down."
+    elif _schema_tool["name"] == "srcds_deploy":
+        _props["refresh_lua"] = {"type": "boolean", "default": False,
+            "description": "After successful changed Lua writes, request existing LuaPack registrations to refresh. Does not enable LuaPack or confirm client execution."}
+
+TOOLS.append({
+    "name": "srcds_diagnostics",
+    "description": "Optional HolyLib profiling/netstats and stock Lua-error collection. Fixed reads need no confirmation; profile, errors_start/stop and refresh require confirm. Error storage expires and resets with the map; save the returned cursor for independent incremental reads. Profiles preserve counters and existing sessions. No native installation or listener.",
+    "inputSchema": {"type": "object", "properties": {
+        "server": SERVER_ENUM,
+        "action": {"type": "string", "enum": ["capabilities", "players", "profile", "errors_start", "errors", "errors_stop", "refresh"], "default": "capabilities"},
+        "confirm": {"type": "boolean", "default": False},
+        "seconds": {"type": "number", "minimum": 0.1, "maximum": 5, "default": 1, "description": "Profile duration; needs active server frames."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+        "offset": {"type": "integer", "minimum": 0, "maximum": 511, "default": 0, "description": "Players: zero-based offset in a fresh snapshot."},
+        "ttl": {"type": "integer", "minimum": 10, "maximum": 3600, "default": 600, "description": "errors_start lifetime in seconds; an active collector is reused without resetting or extending it."},
+        "after": {"type": "string", "description": "Errors: cursor from a previous read/start. Omit to read retained history."},
+        "maxbytes": {"type": "integer", "minimum": 4096, "maximum": 24000, "default": 12000, "description": "Errors: JSON page budget."},
+        "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100,
+            "description": "Refresh: exact garrysmod-relative Lua source paths. Server refresh status never confirms client execution."},
+    }, "required": ["server"]},
+})
+
 DISPATCH = {
     "srcds_status": tool_status,
     "srcds_fetch": tool_fetch,
@@ -4759,6 +4957,7 @@ DISPATCH = {
     "srcds_db_schema": tool_db_schema,
     "srcds_mongo_query": tool_mongo_query,
     "srcds_mongo_schema": tool_mongo_schema,
+    "srcds_diagnostics": tool_diagnostics,
 }
 
 
