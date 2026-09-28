@@ -4407,18 +4407,18 @@ TOOLS = [
     },
     {
         "name": "srcds_fetch",
-        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': read a file with line numbers from line 1 (page with offset/lines; grep searches the whole file and returns numbered matches); what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
+        "description": "Read-only remote volume/console access. what='console': tail console.log; what='docker': tail the container log; what='file': numbered lines from line 1 (page with offset/lines; grep searches the whole file); what='dir': list a directory; what='hash': hash a tree, then send ALL differing files together in one srcds_diff files=[...] batch; what='backups': list deploy backups. save_to writes into the LOCAL filesystem and therefore requires confirm=true (plus overwrite=true for an existing file). Remote paths are realpath-confined beneath garrysmod/.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "server": SERVER_ENUM,
                 "what": {"type": "string", "enum": ["console", "file", "dir", "hash", "backups", "docker"], "default": "console"},
-                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail this many lines (max 2000). file: lines, or grep matches, per read (max 5000). history: deployments per page (default 20, max 100), or files per page with deployment_id (default 50, max 200)."},
-                "offset": {"type": "integer", "default": 1, "description": "file: 1-based first line to return (with grep, the first line searched). Negative starts that many lines before the end: -50 reads the last 50 lines. The reply names the next offset when more remain. history with deployment_id: 1-based first file."},
+                "lines": {"type": "integer", "default": 200, "description": "console/docker: tail lines (max 2000). file: lines or grep matches per read (max 5000). history: page size (20, max 100; with deployment_id, files per page: 50, max 200)."},
+                "offset": {"type": "integer", "default": 1, "description": "file: first line (1-based; with grep, the first line searched); negative counts from the end (-50 = last 50 lines). Replies name the next offset. history with deployment_id: first file."},
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
-                "grep": {"type": "string", "description": "Optional substring filter. file: searches the whole file and returns numbered matching lines; console/docker: filters the tailed lines."},
-                "maxbytes": {"type": "integer", "default": 12000, "description": "Byte cap on returned text (max 200000). console/docker keep the most recent slice; file keeps whole lines from the start of the window and names the next offset. ANSI color codes are always stripped."},
+                "grep": {"type": "string", "description": "Substring filter: file searches the whole file; console/docker filter the tailed lines."},
+                "maxbytes": {"type": "integer", "default": 12000, "description": "Byte cap on returned text (max 200000): logs keep the newest slice, files name the next offset. ANSI codes are stripped."},
                 "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
                 "overwrite": {"type": "boolean", "default": False, "description": "Allow save_to to replace an existing local file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required when save_to is used because that writes to the local filesystem."},
@@ -4459,7 +4459,7 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Server Lua / verification suite. e.g. 'return player.GetCount()' or a multi-line CHECK/EQ assertion suite. Use `return <expr>` or LOG(...) to get values back."},
-                "local": {"type": "string", "description": "Instead of code: path of a local UTF-8 Lua file (max 64 KiB). Write a suite once and rerun it by path."},
+                "local": {"type": "string", "description": "Instead of code: a local UTF-8 Lua file (max 64 KiB), so a suite is rerun by path."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required for every srcds_lua call."},
                 "async": {"type": "boolean", "default": False, "description": "True for suites using timers/coroutines/http; then call MCP_DONE() from the final callback."},
                 "async_timeout": {"type": "integer", "default": 20, "description": "Seconds to wait for MCP_DONE() when async=true (max ~30)."},
@@ -4483,7 +4483,6 @@ TOOLS = [
                                     "properties": {"to": {"type": "string"}, "local": {"type": "string"}, "content": {"type": "string"}},
                                     "required": ["to"]}},
                 "restore": {"type": "boolean", "default": False, "description": "Roll back 'to' (or every files[].to) to its last deploy backup instead of writing new content (local/content ignored; the backup is kept)."},
-                "backup": {"type": "boolean", "default": True, "description": "Back up overwritten files to the out-of-tree backups root, not next to the file."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true to actually write."},
             },
             "required": ["server"],
@@ -4491,7 +4490,7 @@ TOOLS = [
     },
     {
         "name": "srcds_grep",
-        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Matches are grouped by file: the path once, then N:text with indentation stripped (N-text for context lines). output='files' lists matching files only. Read-only, always allowed.",
+        "description": "Recursively grep deployed source in one bounded host call. Use pattern or patterns[] (multiple regexes are OR alternatives), glob or globs[] (multiple include filters), exclude_globs[], and path or paths[]. Output groups matches by file: the path once, then N:text (N-text for context). Read-only, always allowed.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4509,11 +4508,11 @@ TOOLS = [
                                   "items": {"type": "string"}, "description": "Filename globs to exclude."},
                 "max": {"type": "integer", "default": 50, "description": "Max matches (or files with output='files') to return, up to 2000; the total is still counted."},
                 "regex": {"type": "string", "enum": ["basic", "extended", "fixed", "perl"], "default": "basic",
-                          "description": "Pattern syntax: basic (grep -G), extended (-E: a|b, +, ?, {n}), fixed strings (-F), or perl (-P: \\d, \\b, lookaround)."},
+                          "description": "basic (grep -G), extended (-E: a|b + ?), fixed (-F) or perl (-P: \\d \\b)."},
                 "ignore_case": {"type": "boolean", "default": False, "description": "Case-insensitive matching (grep -i)."},
-                "context": {"type": "integer", "default": 0, "description": "Lines of context around each match (0-10), shown as N-text."},
+                "context": {"type": "integer", "default": 0, "description": "Context lines around each match (0-10)."},
                 "output": {"type": "string", "enum": ["lines", "files"], "default": "lines",
-                           "description": "lines: grouped matches. files: only the names of matching files (grep -l)."},
+                           "description": "files: only matching file names (grep -l)."},
             },
             "required": ["server"],
             "anyOf": [{"required": ["pattern"]}, {"required": ["patterns"]}],
@@ -4560,7 +4559,7 @@ TOOLS = [
             "properties": {
                 "server": SERVER_ENUM,
                 "code": {"type": "string", "description": "Clientside Lua to run on the target players."},
-                "local": {"type": "string", "description": "Instead of code: path of a local UTF-8 Lua file (max 64 KiB)."},
+                "local": {"type": "string", "description": "Instead of code: a local UTF-8 Lua file (max 64 KiB)."},
                 "target": {"type": "string", "description": "Required: 'all', exact SteamID, or exact 17-digit SteamID64. Nicknames are intentionally rejected."},
                 "broadcast": {"type": "boolean", "default": False, "description": "Required true when target='all'."},
                 "force": {"type": "boolean", "default": False, "description": "Required true when target='all', even if A2S reports quiet/unknown."},
@@ -4696,7 +4695,7 @@ for _schema_tool in TOOLS:
     _props = _schema_tool["inputSchema"]["properties"]
     if _schema_tool["name"] in ("srcds_db_query", "srcds_db_schema", "srcds_mongo_query", "srcds_mongo_schema"):
         _props["maxbytes"] = {"type": "integer", "default": DB_DEFAULT_MAXBYTES,
-                              "description": "Byte cap on returned output (max %d)." % OUTPUT_MAX_BYTES}
+                              "description": "Output byte cap (max %d)." % OUTPUT_MAX_BYTES}
     if _schema_tool["name"] == "srcds_deploy":
         _schema_tool["description"] = ("Guarded file deployment. SINGLE: to + expected_sha256 + exactly one of local/content. "
             "BATCH: files=[{to,expected_sha256,local|content},...] in one call. Fresh target resolution, per-volume lock, "
@@ -4712,7 +4711,6 @@ for _schema_tool in TOOLS:
         _props["files"]["items"]["properties"].update(expected_sha256=dict(_EXPECTED_SCHEMA), backup_id=dict(_BACKUP_ID_SCHEMA))
         _props["files"]["items"]["required"] = ["to", "expected_sha256"]
         _props["restore"]["description"] = "Restore an explicit backup_id; requires current-file expected_sha256 and no local/content. The displaced current version is backed up."
-        _props["backup"].update(const=True, description="Versioned backups are mandatory. False is rejected.")
         _schema_tool["inputSchema"]["oneOf"] = [
             {"required": ["files"], "not": {"anyOf": [{"required": [k]} for k in ("to", "local", "content", "expected_sha256", "backup_id")]}},
             {"required": ["to", "expected_sha256"], "not": {"required": ["files"]}}]
@@ -4720,7 +4718,7 @@ for _schema_tool in TOOLS:
         _props["what"]["enum"].append("history")
         _props["before"] = {"type": "string", "description": "For history: the 'before' cursor printed by the previous page."}
         _props["deployment_id"] = {"type": "string", "pattern": "^[0-9]{20}-[0-9a-f]{16}$",
-                                   "description": "For history: list this deployment's files with full hashes (page with offset/lines)."}
+                                   "description": "For history: this deployment's files with full hashes (page with offset/lines)."}
         _props["path"]["description"] += " For history/backups: optional relative path prefix filter."
         _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' lists deployments newest first, one line each (lines=page size, max 100; before=cursor); deployment_id shows one deployment's files. Backups list explicit backup_id values."
 
