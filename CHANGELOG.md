@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.2.0 — Optional runtime diagnostics
+
+- Add `srcds_diagnostics` for current capabilities, client network snapshots,
+  bounded VProf samples, and stock server/client Lua-error hooks. Error collectors
+  expire, cap retained records, and support independent cursors with gap reporting.
+  Profiles preserve counters and balance only starts owned by the sampler.
+  Require HolyLib's `vprof.NODE_GC_SAFE` capability before traversing native nodes;
+  discard startup frames and exclude the root/idle bucket from ranked timings.
+- Add opt-in diagnostic/player details to `srcds_status`, and `srcds_fetch
+  what="crashes"` for contained crash-log listings and numbered reads while down.
+- Add opt-in `srcds_deploy refresh_lua=true` and a separate diagnostic refresh
+  action. Keep exact source paths and distinguish completed writes from LuaPack
+  status. Queued/captured refreshes never claim client execution.
+- Bundle `srcds_diagnostics.lua` beside the Python entry point. Diagnostics use
+  the existing console/file transport; no listener or native module is installed.
+
 ## 2.1.0 — Complete file reads, compact results for repeated calls
 
 Agents call these tools many times per session, and every result stays in

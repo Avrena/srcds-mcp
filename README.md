@@ -28,7 +28,7 @@ The node must host the game volumes and have Docker available.
    repository. On Windows, use forward slashes or escaped backslashes in JSON.
 2. Check configuration with
    `python -c "import srcds_mcp as m; print(m.config_error() or 'config OK')"`.
-3. Register the script using the absolute Python/script paths in
+3. Keep `srcds_diagnostics.lua` beside `srcds_mcp.py`. Register the script using the absolute Python/script paths in
    [`mcp.json.example`](mcp.json.example). It includes JSON and Codex TOML forms.
 4. Restart the MCP connection, then run `srcds_status` to check discovery.
 
@@ -43,6 +43,7 @@ actual node configurations outside Git.
 | Tool | Gate | Purpose |
 | --- | --- | --- |
 | `srcds_status` | Always allowed | Up/down, A2S player count, threshold state, port, capture capability. Hostnames and container IDs are omitted. |
+| `srcds_diagnostics` | Fixed reads automatic; profile, collector start/stop, and refresh confirm | Optional HolyLib capabilities, profiling, network snapshots, and stock Lua-error collection. |
 | `srcds_fetch` | Remote reads allowed; `save_to` requires confirm | Console/container log tails, numbered file reads with paging and whole-file grep, directory listings, hashes, deploy backups, and deployment history. |
 | `srcds_console` | Allowlisted reads automatic; otherwise confirm | One console command. Multiline/compound commands always require confirmation. |
 | `srcds_lua` | Always confirm | Server Lua and asynchronous verification suites, inline or from a local file. Arbitrary Lua is not statically classified as safe. |
@@ -224,6 +225,69 @@ instructions/output/failure detail, and treats missing start/end markers as an
 error. Asynchronous suites set `async:true` and call `MCP_DONE()` from the final
 callback. Helper functions and finalization state are isolated per runner, so
 overlapping async requests cannot finalize or log into one another.
+
+## Optional runtime diagnostics
+
+`srcds_diagnostics` uses fixed Lua operations over the existing framed transport.
+Keep `srcds_diagnostics.lua` beside the Python entry point. No native module,
+listener, or autorun file is installed by these operations. HolyLib is optional;
+basic player ping/loss and the error collector work without it.
+
+```text
+srcds_diagnostics {server: "game", action: "capabilities"}
+srcds_diagnostics {server: "game", action: "players", limit: 20, offset: 0}
+srcds_diagnostics {server: "game", action: "profile", seconds: 1, limit: 10, confirm: true}
+srcds_diagnostics {server: "game", action: "errors_start", ttl: 600, confirm: true}
+srcds_diagnostics {server: "game", action: "errors", after: "<returned cursor>"}
+srcds_diagnostics {server: "game", action: "errors_stop", confirm: true}
+srcds_fetch {server: "game", what: "crashes", lines: 20}
+srcds_fetch {server: "game", what: "crashes", path: "<listed filename>", lines: 100}
+```
+
+- Capabilities are checked afresh, including individual APIs. `srcds_status`
+  accepts `diagnostics:true` and `players:true` for the same optional details;
+  these add Lua-call latency. Player snapshots report native sign-on, directional
+  latency/loss, current choked-packet counts and timeout settings when available.
+  Native slots are zero-based; loss fields are percentages and latency is in ms.
+  Missing channel data remains absent. Use `next_offset` to page a fresh snapshot.
+- Profiles last 0.1–5 seconds and return cumulative-counter differences ranked
+  by self time after three warm-up frames. The root/idle bucket is excluded.
+  Profiles require `vprof.NODE_GC_SAFE = true` from HolyLib's
+  [borrowed-node ownership fix](https://github.com/ncgst/gmod-holylib/pull/23);
+  older native wrappers can delete engine-owned profile nodes during collection.
+  Existing profiling sessions and counters are preserved. Collection
+  requires active frames; empty servers with hibernation thinking disabled are
+  rejected. VProf gamemode nodes aggregate an event's callbacks; they do not
+  identify every `hook.Add` callback separately. Counter resets, tree changes,
+  or traversal limits produce an explicit error rather than misleading timings.
+- The collector uses stock `OnLuaError` and `OnClientLuaError`. It retains at most
+  128 records, bounds messages/stacks, and coalesces consecutive matching records
+  within one second. `count` is the record's cumulative occurrence count. A repeat
+  advances its cursor so existing readers can see the updated count. Reads do not
+  consume records; each reader keeps its own `after` cursor. `more` indicates a
+  further page, `dropped` counts evicted occurrences, and `gap` reports overwritten
+  unread history. An insufficient byte budget leaves the cursor unchanged.
+- Collection expires after `ttl` seconds (10–3600) or stops on map shutdown.
+  Starting an active collector reuses it without resetting history or extending
+  its expiry. Map changes/restarts lose the buffer and invalidate its cursors.
+  Registration does not prove engine delivery: `server_observed` and
+  `client_observed` indicate received events. Client reports can be rate limited
+  and lack stacks; the buffer is not a complete error history. Hooks observe
+  events without suppressing normal output. No persistent log is written.
+- Crash logs are listed newest first and can be read while the game is down.
+  Reads remain confined to the game volume and reject individual symlink files.
+
+Set `refresh_lua:true` on a confirmed deployment to request LuaPack refreshes
+after successful changed Lua writes. Exact `garrysmod`-relative paths are retained
+to avoid selecting a shadowing addon. LuaPack must already be enabled and the
+file must already be registered. Unsupported, disabled, and ineligible states
+are reported; this option never enables LuaPack. `captured` and `refresh_queued`
+describe server processing, **not client execution**.
+
+If a refresh fails after files were written, the deployment receipt still reports
+the completed write. Retry only the refresh with `srcds_diagnostics action:"refresh",
+paths:["addons/example/lua/client.lua"], confirm:true`; reconcile file content
+before retrying a deployment. No-op or rejected deployments request no refresh.
 
 ## Client Lua transport
 
