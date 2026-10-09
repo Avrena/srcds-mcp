@@ -322,6 +322,47 @@ class DiffAndDeployOutputTests(ToolTestCase):
         self.assertFalse(error, again)
         self.assertEqual(len(again.split("\n")), 2, again)
 
+    def test_deploy_rejects_a_shortened_base_hash(self):
+        self.write("data/edit", b"old")
+        with mock.patch.object(MCP, "run_driver") as run, \
+             mock.patch.object(MCP, "resolve", return_value=self.h.srv):
+            text, error = MCP.tool_deploy({"server": MCP.SERVER_NAMES[0], "confirm": True, "files": [
+                {"to": "data/edit", "content": "new", "expected_sha256": sha(b"old")[:16]}]})
+        self.assertTrue(error)
+        self.assertIn("shortened hash", text)
+        run.assert_not_called()
+
+
+class HashListingTests(ToolTestCase):
+    def listing(self, n, **args):
+        files = {"f%02d.lua" % i: [sha(b"%d" % i), 1] for i in range(n)}
+        with mock.patch.object(MCP, "run_driver", return_value={"ok": True, "files": files, "count": n}), \
+             mock.patch.object(MCP, "resolve", return_value=self.h.srv), \
+             mock.patch.object(MCP, "log_event"):
+            text, error = MCP.tool_fetch(dict(server=MCP.SERVER_NAMES[0], what="hash", path="lua/t", **args))
+        self.assertFalse(error, text)
+        return text
+
+    def test_short_listing_prints_full_hashes(self):
+        text = self.listing(MCP.HASH_FULL_MAX_FILES)
+        self.assertIn("\n%s 1 f00.lua\n" % sha(b"0"), text)
+        self.assertNotIn("prefixes", text)
+
+    def test_long_listing_prints_prefixes_and_explains_once(self):
+        text = self.listing(MCP.HASH_FULL_MAX_FILES + 1)
+        self.assertIn("— 21 file(s), 16-hex prefixes", text.split("\n")[0])
+        self.assertIn("\n%s 1 f00.lua\n" % sha(b"0")[:16], text)
+        self.assertNotIn(sha(b"0"), text)
+        self.assertIn("full_hashes=true", text)
+        again = self.listing(MCP.HASH_FULL_MAX_FILES + 1)
+        self.assertIn("16-hex prefixes", again)
+        self.assertNotIn("comparison only", again)
+
+    def test_full_hashes_overrides_the_prefix(self):
+        text = self.listing(MCP.HASH_FULL_MAX_FILES + 1, full_hashes=True)
+        self.assertIn("\n%s 1 f20.lua" % sha(b"20"), text)
+        self.assertNotIn("prefixes", text)
+
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "host grep integration requires Linux and GNU grep")
 class GrepOutputTests(ToolTestCase):

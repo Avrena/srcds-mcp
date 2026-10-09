@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.3.1 — Shorter tree hash listings
+
+- `srcds_fetch what="hash"` prints 16-hex hash prefixes when a listing has
+  more than 20 files. A full SHA-256 costs a model about 40-50 tokens, and large
+  listings are used to find mismatches, which a prefix does as well. Listings
+  of up to 20 files, and any listing with `full_hashes=true`, keep full hashes.
+  The 48 KB listing budget now fits about three times as many entries.
+- Deploy still accepts only a full SHA-256 or `missing` as `expected_sha256`;
+  a shortened hash is rejected with a message that names the full-hash sources.
+
+## 2.3.0 — In-server player counts
+
+- Count players inside the running server by default for `srcds_status`, the
+  `srcds_power` force rule, and population notes in confirmation prompts. A new
+  fixed diagnostics action counts connected HolyLib clients that are not bots or
+  SourceTV, including clients still loading, and falls back to stock player
+  entities plus connecting clients. Servers may fake public A2S_INFO, for
+  example always reporting zero players, which let stop/restart/kill pass
+  without `force=true` while players were connected.
+- A failed count reports the population as unknown, so disruptive power actions
+  still require `force=true`; A2S is not used as a fallback.
+- Add `player_count_source` (`"holylib"` by default, or `"a2s"` for the previous
+  public-reply count). Status lines name the count source and show the in-game
+  share when clients are still loading.
+
 ## 2.2.0 — Optional runtime diagnostics
 
 - Add `srcds_diagnostics` for current capabilities, client network snapshots,

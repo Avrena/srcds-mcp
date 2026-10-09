@@ -42,7 +42,7 @@ actual node configurations outside Git.
 
 | Tool | Gate | Purpose |
 | --- | --- | --- |
-| `srcds_status` | Always allowed | Up/down, A2S player count, threshold state, port, capture capability. Hostnames and container IDs are omitted. |
+| `srcds_status` | Always allowed | Up/down, in-server player count (HolyLib by default), threshold state, port, capture capability. Hostnames and container IDs are omitted. |
 | `srcds_diagnostics` | Fixed reads automatic; profile, collector start/stop, and refresh confirm | Optional HolyLib capabilities, profiling, network snapshots, and stock Lua-error collection. |
 | `srcds_fetch` | Remote reads allowed; `save_to` requires confirm | Console/container log tails, numbered file reads with paging and whole-file grep, directory listings, hashes, deploy backups, and deployment history. |
 | `srcds_console` | Allowlisted reads automatic; otherwise confirm | One console command. Multiline/compound commands always require confirmation. |
@@ -151,7 +151,10 @@ read-only and do not require confirmation. Diff limits are 16 MiB per side and
 batch.
 
 For trees, call `srcds_fetch` with `what:"hash"`, compare the listings, then
-batch-diff only mismatches. A batch diff prints each differing or failed file
+batch-diff only mismatches. A listing of more than 20 files prints 16-hex hash
+prefixes, which are enough to find mismatches; the batch diff's `sha256_a`
+gives the full deploy base. Pass `full_hashes:true` for full hashes in a
+longer listing. A batch diff prints each differing or failed file
 and only counts identical ones. A deploy result lists only files whose hash
 changed; an unchanged file keeps the `expected_sha256` that was sent.
 
@@ -288,6 +291,19 @@ If a refresh fails after files were written, the deployment receipt still report
 the completed write. Retry only the refresh with `srcds_diagnostics action:"refresh",
 paths:["addons/example/lua/client.lua"], confirm:true`; reconcile file content
 before retrying a deployment. No-op or rejected deployments request no refresh.
+
+## Player counts
+
+`srcds_status`, the `srcds_power` force rule, and the population notes in
+confirmation prompts count players inside the running server through the Lua
+runner. With HolyLib, connected clients that are not bots or SourceTV count,
+including clients still loading; otherwise player entities plus
+`player.GetCountConnecting()`, when available, count. If the query fails, the
+population is unknown and stop/restart/kill require `force=true`; the public
+A2S reply is not used as a fallback. A server may fake A2S_INFO (for example,
+always reporting zero players to deter scripted queries), so set
+`"player_count_source": "a2s"` only for servers whose public reply is accurate.
+Each in-server count adds Lua-call latency.
 
 ## Client Lua transport
 

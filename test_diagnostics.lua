@@ -239,4 +239,44 @@ test("LuaPack refresh preserves exact paths and never enables the feature", func
     assert(seen[1] == paths[1] and result.files[1].status == "refresh_queued" and not result.client_execution_verified)
 end)
 
+local function entity(bot)
+    return {IsBot = function() return bot end}
+end
+
+local function client(connected, fake, hltv)
+    return {IsConnected = function() return connected end,
+        IsFakeClient = function() return fake end, IsHLTV = function() return hltv end}
+end
+
+test("stock population counts humans and connecting clients, not bots", function()
+    local f = fixture()
+    f.env.player.GetAll = function() return {entity(false), entity(false), entity(true)} end
+    f.env.player.GetCountConnecting = function() return 1 end
+    f.env.game.MaxPlayers = function() return 32 end
+    local r = f.call("population")
+    assert(r.ok and r.source == "stock" and r.players == 3 and r.in_game == 2 and r.bots == 1 and r.max == 32)
+end)
+
+test("HolyLib population includes loading clients and skips bots, SourceTV and free slots", function()
+    local f = fixture()
+    f.env.player.GetAll = function() return {entity(false), entity(true)} end
+    f.env.gameserver = {GetAll = function() return {client(true, false, false), client(true, false, false),
+        client(true, true, false), client(true, false, true), client(false, false, false)} end}
+    local getConVar = f.env.GetConVar
+    f.env.GetConVar = function(name)
+        if name == "sv_visiblemaxplayers" then return {GetInt = function() return 80 end} end
+        return getConVar(name)
+    end
+    local r = f.call("population")
+    assert(r.ok and r.source == "holylib" and r.players == 2 and r.in_game == 1 and r.bots == 1 and r.max == 80)
+end)
+
+test("population never drops below the stock count when client methods are missing", function()
+    local f = fixture()
+    f.env.player.GetAll = function() return {entity(false)} end
+    f.env.gameserver = {GetAll = function() return {{}} end}
+    local r = f.call("population")
+    assert(r.ok and r.players == 1)
+end)
+
 print("Diagnostic Lua tests: " .. passed .. " passed")

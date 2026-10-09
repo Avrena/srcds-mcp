@@ -137,3 +137,60 @@ class DiagnosticTests(ToolTestCase):
         self.assertIn("crashes", tools["srcds_fetch"]["what"]["enum"])
         self.assertIn("refresh_lua", tools["srcds_deploy"])
         self.assertIn("diagnostics", tools["srcds_status"])
+
+
+class PopulationTests(ToolTestCase):
+    COUNT = {"ok": True, "source": "holylib", "players": 2, "in_game": 1, "bots": 0, "max": 80}
+    FAKE_A2S = {"name": "test", "map": "test", "players": 0, "maxplayers": 80, "bots": 0}
+
+    def test_in_server_count_is_the_default_and_ignores_a2s(self):
+        with mock.patch.object(MCP, "_diagnostics_call", return_value=self.COUNT) as call, \
+             mock.patch.object(MCP, "a2s_info", return_value=self.FAKE_A2S) as a2s:
+            self.assertEqual(MCP.live_info(self.h.srv), (2, 80, True))
+        self.assertEqual(call.call_args.args[1], {"action": "population"})
+        a2s.assert_not_called()
+
+    def test_failed_or_invalid_counts_are_unknown_without_a2s_fallback(self):
+        bad = [{"ok": False, "error": "server is loading"}, dict(self.COUNT, players=True),
+               dict(self.COUNT, players=-1), dict(self.COUNT, players=1.5),
+               dict(self.COUNT, players="2"), dict(self.COUNT, players=None)]
+        for result in bad:
+            with mock.patch.object(MCP, "_diagnostics_call", return_value=result), \
+                 mock.patch.object(MCP, "a2s_info", return_value=self.FAKE_A2S) as a2s:
+                self.assertEqual(MCP.live_info(self.h.srv), (None, None, None), result)
+            a2s.assert_not_called()
+
+    def test_down_server_is_not_queried(self):
+        with mock.patch.object(MCP, "_diagnostics_call") as call:
+            self.assertEqual(MCP.live_info(dict(self.h.srv, running=False)), (None, None, False))
+        call.assert_not_called()
+
+    def test_a2s_remains_available_as_an_explicit_source(self):
+        with mock.patch.object(MCP, "PLAYER_COUNT_SOURCE", "a2s"), \
+             mock.patch.object(MCP, "_diagnostics_call") as call, \
+             mock.patch.object(MCP, "a2s_info", return_value=dict(self.FAKE_A2S, players=3)):
+            self.assertEqual(MCP.live_info(self.h.srv)[:2], (3, 80))
+        call.assert_not_called()
+
+    def test_power_requires_force_when_a2s_is_faked_to_zero(self):
+        with mock.patch.object(MCP, "resolve", return_value=self.h.srv), \
+             mock.patch.object(MCP, "_diagnostics_call", return_value=self.COUNT), \
+             mock.patch.object(MCP, "a2s_info", return_value=self.FAKE_A2S), \
+             mock.patch.object(MCP, "run_driver") as run:
+            text, error = MCP.tool_power({"server": self.h.srv["logical"], "action": "restart", "confirm": True})
+        self.assertTrue(error, text)
+        self.assertIn("2 connected player(s)", text)
+        run.assert_not_called()
+
+    def test_status_names_the_source_loading_clients_and_failures(self):
+        srv = dict(self.h.srv, condebug=False)
+        with mock.patch.object(MCP, "discover", return_value=[srv]), \
+             mock.patch.object(MCP, "_diagnostics_call", return_value=self.COUNT):
+            text, error = MCP.tool_status({})
+        self.assertFalse(error, text)
+        self.assertIn("players=2/80 (1 in game)", text)
+        self.assertIn("count=holylib", text)
+        with mock.patch.object(MCP, "discover", return_value=[srv]), \
+             mock.patch.object(MCP, "_diagnostics_call", return_value={"ok": False, "error": "loading"}):
+            text, error = MCP.tool_status({})
+        self.assertIn("players=?? (holylib: loading)", text)
