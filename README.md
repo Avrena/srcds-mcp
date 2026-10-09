@@ -151,7 +151,10 @@ read-only and do not require confirmation. Diff limits are 16 MiB per side and
 batch.
 
 For trees, call `srcds_fetch` with `what:"hash"`, compare the listings, then
-batch-diff only mismatches. A batch diff prints each differing or failed file
+batch-diff only mismatches. A listing of more than 20 files prints 16-hex hash
+prefixes, which are enough to find mismatches; the batch diff's `sha256_a`
+gives the full deploy base. Pass `full_hashes:true` for full hashes in a
+longer listing. A batch diff prints each differing or failed file
 and only counts identical ones. A deploy result lists only files whose hash
 changed; an unchanged file keeps the `expected_sha256` that was sent.
 

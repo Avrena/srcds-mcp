@@ -24,7 +24,7 @@ and rotate beside the selected config file.
 import sys, os, json, base64, subprocess, socket, struct, re, time, traceback, hashlib
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-MCP_VERSION = "2.3.0"
+MCP_VERSION = "2.3.1"
 import uuid as _uuid
 _CLIENT_INSTANCE = _uuid.uuid4().hex
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -54,6 +54,10 @@ GREP_DEFAULT_MAX = 50
 DB_DEFAULT_MAXBYTES = 12000
 OUTPUT_MAX_BYTES = 200000
 FILE_LINE_MAX_CHARS = 2000
+# what='hash' listings longer than this print hash prefixes (tree comparison only);
+# a full 64-hex hash costs a model about 40-50 tokens per line.
+HASH_FULL_MAX_FILES = 20
+HASH_PREFIX_CHARS = 16
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_KEEP = 3
 
@@ -3160,15 +3164,17 @@ def tool_fetch(args):
             return ("\n".join(out), False)
         if what == "hash":
             files = res.get("files", {})
-            out = ["[%s] sha256 garrysmod/%s (glob=%s) — %d file(s)%s" % (
+            full = args.get("full_hashes") is True or len(files) <= HASH_FULL_MAX_FILES
+            out = ["[%s] sha256 garrysmod/%s (glob=%s) — %d file(s)%s%s" % (
                 server.upper(), args.get("path", ""), args.get("glob") or "*",
                 res.get("count", len(files)),
+                "" if full else ", %d-hex prefixes" % HASH_PREFIX_CHARS,
                 "  [capped at 2000 — narrow path/glob]" if res.get("truncated") else "")]
             # byte-budget the listing (2000 entries would be ~150KB of tokens)
             used, omitted = 0, 0
             for rel in sorted(files):
                 h, sz = files[rel]
-                line = "%s %s %s" % (h or "?", sz, rel)
+                line = "%s %s %s" % ((h if full else h[:HASH_PREFIX_CHARS]) if h else "?", sz, rel)
                 if used + len(line) > 48000:
                     omitted += 1
                     continue
@@ -3180,6 +3186,12 @@ def tool_fetch(args):
             if res.get("skipped_escaped"):
                 out.append("  [%d symlink target(s) escaped garrysmod/ and were not read]" %
                            res["skipped_escaped"])
+            if not full:
+                note = _once("hash-prefix", "Prefixes are for comparison only. A deploy base needs the full SHA-256: "
+                             "diff the mismatches (sha256_a), list at most %d files, or pass full_hashes=true."
+                             % HASH_FULL_MAX_FILES)
+                if note:
+                    out.append(note)
             tip = _once("hash-tip", "TIP: when several hashes differ, compare them in ONE srcds_diff files=[...] batch, not separate calls.")
             if tip:
                 out.append(tip)
@@ -3397,6 +3409,9 @@ def tool_deploy(args):
         seen.add(to)
         expected = f.get("expected_sha256")
         if not isinstance(expected, str) or (expected != "missing" and re.fullmatch(r"[0-9a-f]{64}", expected) is None):
+            if isinstance(expected, str) and re.fullmatch(r"[0-9a-f]{1,63}", expected):
+                return ("STALE_BASE_REQUIRED: %s expected_sha256 is a shortened hash. Send the full 64-hex SHA-256 of the edit base "
+                        "(file read, download, diff sha256_a, or fetch what='hash' with full_hashes=true)." % to, True)
             return ("STALE_BASE_REQUIRED: %s needs expected_sha256 from the original remote file used as the edit base, or 'missing' for creation. Re-fetch and reconcile stale edits; never attach a fresh hash to old content." % to, True)
         entry = {"to": to, "expected_sha256": expected}
         if restore:
@@ -4604,7 +4619,8 @@ SERVER_ENUM = {"type": "string", "enum": list(SERVER_NAMES),
 
 MCP_INSTRUCTIONS = (
     "Deploy protocol v2: every file needs expected_sha256 of the original remote bytes used as its edit base "
-    "(full SHA-256 from fetch/download/diff sha256_a), or literal 'missing' for creation. Keep that base hash "
+    "(full SHA-256 from a file read, download, diff sha256_a, or a hash listing of up to 20 files or with "
+    "full_hashes=true), or literal 'missing' for creation. Keep that base hash "
     "with the working copy. A fresh hash is NOT permission to upload an older working copy: reconcile the "
     "current remote changes into the candidate first. A stale hash rejects the entire batch. Restore also "
     "needs expected_sha256 and explicit backup_id from fetch what='history' or 'backups'. Versioned backups "
@@ -4653,6 +4669,7 @@ TOOLS = [
                 "offset": {"type": "integer", "default": 1, "description": "file: first line (1-based; with grep, the first line searched); negative counts from the end (-50 = last 50 lines). Replies name the next offset. history with deployment_id: first file."},
                 "path": {"type": "string", "description": "For file/dir/hash: path relative to garrysmod/ (e.g. cfg/server.cfg, addons/x/lua)."},
                 "glob": {"type": "string", "description": "For what='hash': filename glob filter (default *)."},
+                "full_hashes": {"type": "boolean", "default": False, "description": "For what='hash': print the full SHA-256 of every file. Listings of more than 20 files otherwise print 16-hex prefixes."},
                 "grep": {"type": "string", "description": "Substring filter: file searches the whole file; console/docker filter the tailed lines."},
                 "maxbytes": {"type": "integer", "default": 12000, "description": "Byte cap on returned text (max 200000): logs keep the newest slice, files name the next offset. ANSI codes are stripped."},
                 "save_to": {"type": "string", "description": "For what='file': save the raw bytes to this LOCAL path instead of returning text (binary-safe, up to 8MB; content never enters the conversation)."},
@@ -4956,7 +4973,7 @@ for _schema_tool in TOOLS:
         _props["deployment_id"] = {"type": "string", "pattern": "^[0-9]{20}-[0-9a-f]{16}$",
                                    "description": "For history: this deployment's files with full hashes (page with offset/lines)."}
         _props["path"]["description"] += " For history/backups: optional relative path prefix filter."
-        _schema_tool["description"] += " Hashes/downloads include full SHA-256. what='history' lists deployments newest first, one line each (lines=page size, max 100; before=cursor); deployment_id shows one deployment's files. Backups list explicit backup_id values."
+        _schema_tool["description"] += " File reads, downloads and hash listings of up to 20 files include full SHA-256; longer hash listings print 16-hex prefixes unless full_hashes=true. what='history' lists deployments newest first, one line each (lines=page size, max 100; before=cursor); deployment_id shows one deployment's files. Backups list explicit backup_id values."
 
 for _schema_tool in TOOLS:
     _props = _schema_tool["inputSchema"]["properties"]

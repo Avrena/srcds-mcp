@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.3.1 — Shorter tree hash listings
+
+- `srcds_fetch what="hash"` prints 16-hex hash prefixes when a listing has
+  more than 20 files. A full SHA-256 costs a model about 40-50 tokens, and large
+  listings are used to find mismatches, which a prefix does as well. Listings
+  of up to 20 files, and any listing with `full_hashes=true`, keep full hashes.
+  The 48 KB listing budget now fits about three times as many entries.
+- Deploy still accepts only a full SHA-256 or `missing` as `expected_sha256`;
+  a shortened hash is rejected with a message that names the full-hash sources.
+
 ## 2.3.0 — In-server player counts
 
 - Count players inside the running server by default for `srcds_status`, the
