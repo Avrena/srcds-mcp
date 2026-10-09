@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.0 — In-server player counts
+
+- Count players inside the running server by default for `srcds_status`, the
+  `srcds_power` force rule, and population notes in confirmation prompts. A new
+  fixed diagnostics action counts connected HolyLib clients that are not bots or
+  SourceTV, including clients still loading, and falls back to stock player
+  entities plus connecting clients. Servers may fake public A2S_INFO, for
+  example always reporting zero players, which let stop/restart/kill pass
+  without `force=true` while players were connected.
+- A failed count reports the population as unknown, so disruptive power actions
+  still require `force=true`; A2S is not used as a fallback.
+- Add `player_count_source` (`"holylib"` by default, or `"a2s"` for the previous
+  public-reply count). Status lines name the count source and show the in-game
+  share when clients are still loading.
+
 ## 2.2.0 — Optional runtime diagnostics
 
 - Add `srcds_diagnostics` for current capabilities, client network snapshots,

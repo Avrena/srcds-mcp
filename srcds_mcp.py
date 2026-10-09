@@ -24,7 +24,7 @@ and rotate beside the selected config file.
 import sys, os, json, base64, subprocess, socket, struct, re, time, traceback, hashlib
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-MCP_VERSION = "2.2.0"
+MCP_VERSION = "2.3.0"
 import uuid as _uuid
 _CLIENT_INSTANCE = _uuid.uuid4().hex
 MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -80,7 +80,11 @@ DEFAULTS = {
         "host": "",                         # REQUIRED: e.g. "root@your-node-ip" (ask your team)
         "port": "22",
     },
-    "public_ip": "",                        # public game IP, for A2S live player counts
+    "public_ip": "",                        # public game IP, for A2S player counts (player_count_source "a2s")
+    # Where safety gates get the player count: "holylib" queries the running server
+    # through the Lua runner (stock player API when HolyLib is absent); "a2s" trusts
+    # the public A2S_INFO reply, which servers can fake to deter scripted queries.
+    "player_count_source": "holylib",
     "volroot": "/var/lib/pterodactyl/volumes",
     "backups_root": "/var/lib/pterodactyl/srcds_mcp_backups",
     "wings": {
@@ -158,6 +162,8 @@ SSH_HOST  = _ssh.get("host") or ""
 SSH_PORT  = str(_ssh.get("port") or "22")
 PUBLIC_IP = CFG.get("public_ip") or ""
 VOLROOT   = CFG.get("volroot")
+# Anything other than "a2s" selects the in-server count.
+PLAYER_COUNT_SOURCE = "a2s" if str(CFG.get("player_count_source") or "").strip().lower() == "a2s" else "holylib"
 
 # Live-traffic thresholds: player count at/above which a server is "LIVE" and
 # destructive actions get a louder warning.
@@ -2322,17 +2328,53 @@ def a2s_info(ip, port, timeout=2.0):
                 pass
 
 
+def _count(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    if value < 0 or value != int(value):
+        return None
+    return int(value)
+
+
+def population(srv):
+    """Return {players, max, in_game, source, error}; players is None when unknown.
+
+    The default source is the running server itself. A2S is opt-in because the
+    public reply can be faked; a failed in-server query never falls back to it.
+    """
+    pop = {"players": None, "max": None, "in_game": None, "source": PLAYER_COUNT_SOURCE, "error": None}
+    if not srv or not srv.get("running"):
+        pop["error"] = "server is down"
+        return pop
+    if PLAYER_COUNT_SOURCE == "a2s":
+        a = a2s_info(PUBLIC_IP, srv["port"]) if srv.get("port") else None
+        if not a:
+            pop["error"] = "A2S unreachable"
+            return pop
+        pop.update(players=a["players"], max=a["maxplayers"])
+        return pop
+    r = _diagnostics_call(srv, {"action": "population"})
+    players = _count(r.get("players"))
+    if not r.get("ok") or players is None:
+        pop["error"] = str(r.get("error") or "invalid population result")[:160]
+        return pop
+    pop.update(players=players, max=_count(r.get("max")), in_game=_count(r.get("in_game")),
+               source=r.get("source") if r.get("source") in ("holylib", "stock") else "holylib")
+    return pop
+
+
+def _live_state(srv, pop):
+    if pop["players"] is None:
+        return None
+    return pop["players"] >= LIVE_THRESHOLD.get(srv["logical"], 9999)
+
+
 def live_info(srv):
     """Return (players, maxplayers, live-state); live-state is tri-state."""
     if not srv or not srv.get("running"):
         return (None, None, False)
-    if not srv.get("port"):
-        return (None, None, None)
-    a = a2s_info(PUBLIC_IP, srv["port"])
-    if not a:
-        return (None, None, None)
-    thr = LIVE_THRESHOLD.get(srv["logical"], 9999)
-    return (a["players"], a["maxplayers"], a["players"] >= thr)
+    pop = population(srv)
+    return (pop["players"], pop["max"], _live_state(srv, pop))
 
 
 # ----------------------------------------------------------------------------
@@ -2422,17 +2464,20 @@ def tool_status(args):
         if not s["running"]:
             lines.append("  %-6s  DOWN" % tag)
             continue
-        players, maxpl, is_live = live_info(s)
+        pop = population(s)
+        players, is_live = pop["players"], _live_state(s, pop)
         thr = LIVE_THRESHOLD.get(s["logical"], "?")
         if players is None:
-            pc = "players=?? (A2S unreachable)"
+            pc = "players=?? (%s: %s)" % (pop["source"], pop["error"])
             live_s = "?"
         else:
-            pc = "players=%d/%s" % (players, maxpl)
+            pc = "players=%d/%s" % (players, "?" if pop["max"] is None else pop["max"])
+            if pop["in_game"] is not None and pop["in_game"] != players:
+                pc += " (%d in game)" % pop["in_game"]
             live_s = ("LIVE" if is_live else "quiet") + (" (>=%s=live)" % thr)
         cap = "condebug" if s["condebug"] else "NO-condebug(blind)"
-        lines.append("  %-6s  UP  %-22s  %-22s  port=%s  %s" % (
-            tag, pc, live_s, s.get("port"), cap))
+        lines.append("  %-6s  UP  %-22s  %-22s  port=%s  count=%s  %s" % (
+            tag, pc, live_s, s.get("port"), pop["source"], cap))
         if args.get("diagnostics"):
             result = _diagnostics_call(s, {"action": "capabilities"})
             lines.append("    diagnostics: " + json.dumps(result, ensure_ascii=False, separators=(",", ":")))
@@ -4097,7 +4142,7 @@ def tool_power(args):
         return ("BLOCKED: power %s on %s.%s Re-call with confirm=true." % (action.upper(), server, ln), True)
     if action in ("stop", "restart", "kill") and args.get("force") is not True:
         if players is None:
-            return ("REFUSED: %s player population is UNKNOWN (A2S unavailable) — %s could disrupt connected "
+            return ("REFUSED: %s player population is UNKNOWN (count query failed) — %s could disrupt connected "
                     "players. Re-call with force=true to override." % (server.upper(), action), True)
         if players > 0:
             return ("REFUSED: %s has %d connected player(s) — %s would disrupt them. Re-call with "
@@ -4582,11 +4627,14 @@ _ALIAS_TXT = ("" if not DB_ALIAS else
 _MONGO_ALIAS_TXT = ("" if not MONGO_ALIAS else
                     " Configured aliases: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(MONGO_ALIAS.items())) + ".")
 _MONGO_NOTE_TXT = (" " + MONGO_CFG["note"].strip()) if (MONGO_CFG.get("note") or "").strip() else ""
+_COUNT_TXT = ("via public A2S, which the server may fake" if PLAYER_COUNT_SOURCE == "a2s" else
+              "queried inside the server via HolyLib, or the stock player API without it: connected human "
+              "clients, including those still loading")
 
 TOOLS = [
     {
         "name": "srcds_status",
-        "description": "List the configured game servers (%s): up/down, live player count (via A2S), LIVE flag vs per-server thresholds, port, and whether console output capture (-condebug) is available. Hostnames and container identifiers are intentionally omitted. Read-only, always allowed." % _NAMES_TXT,
+        "description": "List the configured game servers (%s): up/down, live player count (%s), LIVE flag vs per-server thresholds, port, and whether console output capture (-condebug) is available. Hostnames and container identifiers are intentionally omitted. Read-only, always allowed." % (_NAMES_TXT, _COUNT_TXT),
         "inputSchema": {
             "type": "object",
             "properties": {"server": {"type": "string", "enum": list(SERVER_NAMES),
@@ -4750,7 +4798,7 @@ TOOLS = [
                 "local": {"type": "string", "description": "Instead of code: a local UTF-8 Lua file (max 64 KiB)."},
                 "target": {"type": "string", "description": "Required: 'all', exact SteamID, or exact 17-digit SteamID64. Nicknames are intentionally rejected."},
                 "broadcast": {"type": "boolean", "default": False, "description": "Required true when target='all'."},
-                "force": {"type": "boolean", "default": False, "description": "Required true when target='all', even if A2S reports quiet/unknown."},
+                "force": {"type": "boolean", "default": False, "description": "Required true when target='all', even if the player count is quiet/unknown."},
                 "confirm": {"type": "boolean", "default": False, "description": "Required true (executes code on clients)."},
             },
             "required": ["server", "target"],
@@ -4759,7 +4807,7 @@ TOOLS = [
     },
     {
         "name": "srcds_power",
-        "description": "Power-control through the Pterodactyl wings API. Requires confirm=true. stop/restart/kill additionally require force=true whenever any players are connected OR A2S population is unknown (fail closed). start/restart arm a boot watcher; action='watch' polls it read-only. Falls back to raw docker only if wings is unreachable.",
+        "description": "Power-control through the Pterodactyl wings API. Requires confirm=true. stop/restart/kill additionally require force=true whenever any players are connected OR the player count is unknown (fail closed). start/restart arm a boot watcher; action='watch' polls it read-only. Falls back to raw docker only if wings is unreachable.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -42,7 +42,7 @@ actual node configurations outside Git.
 
 | Tool | Gate | Purpose |
 | --- | --- | --- |
-| `srcds_status` | Always allowed | Up/down, A2S player count, threshold state, port, capture capability. Hostnames and container IDs are omitted. |
+| `srcds_status` | Always allowed | Up/down, in-server player count (HolyLib by default), threshold state, port, capture capability. Hostnames and container IDs are omitted. |
 | `srcds_diagnostics` | Fixed reads automatic; profile, collector start/stop, and refresh confirm | Optional HolyLib capabilities, profiling, network snapshots, and stock Lua-error collection. |
 | `srcds_fetch` | Remote reads allowed; `save_to` requires confirm | Console/container log tails, numbered file reads with paging and whole-file grep, directory listings, hashes, deploy backups, and deployment history. |
 | `srcds_console` | Allowlisted reads automatic; otherwise confirm | One console command. Multiline/compound commands always require confirmation. |
@@ -288,6 +288,19 @@ If a refresh fails after files were written, the deployment receipt still report
 the completed write. Retry only the refresh with `srcds_diagnostics action:"refresh",
 paths:["addons/example/lua/client.lua"], confirm:true`; reconcile file content
 before retrying a deployment. No-op or rejected deployments request no refresh.
+
+## Player counts
+
+`srcds_status`, the `srcds_power` force rule, and the population notes in
+confirmation prompts count players inside the running server through the Lua
+runner. With HolyLib, connected clients that are not bots or SourceTV count,
+including clients still loading; otherwise player entities plus
+`player.GetCountConnecting()`, when available, count. If the query fails, the
+population is unknown and stop/restart/kill require `force=true`; the public
+A2S reply is not used as a fallback. A server may fake A2S_INFO (for example,
+always reporting zero players to deter scripted queries), so set
+`"player_count_source": "a2s"` only for servers whose public reply is accurate.
+Each in-server count adds Lua-call latency.
 
 ## Client Lua transport
 

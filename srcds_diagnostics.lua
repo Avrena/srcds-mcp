@@ -144,6 +144,37 @@ local function players(request)
         more = request.offset + #shown < #rows, scan_limited = #rows >= 512}
 end
 
+-- Human population for safety gates. Each source is a lower bound, so take the
+-- larger one: player entities plus stock connecting clients, and HolyLib's
+-- connected non-bot, non-SourceTV clients (which include clients still loading).
+---@return table
+local function population()
+    local inGame, bots = 0, 0
+    for _, ply in ipairs(player.GetAll()) do
+        if method(ply, "IsBot") == true then bots = bots + 1 else inGame = inGame + 1 end
+    end
+    local connecting = 0
+    if type(player.GetCountConnecting) == "function" then
+        local ok, value = pcall(player.GetCountConnecting)
+        connecting = ok and number(value) or 0
+    end
+    local clients
+    if functions(gameserver, {"GetAll"}) then
+        clients = 0
+        for _, client in ipairs(gameserver.GetAll()) do
+            if method(client, "IsConnected") == true and method(client, "IsFakeClient") ~= true
+                and method(client, "IsHLTV") ~= true then
+                clients = clients + 1
+            end
+        end
+    end
+    local visible = GetConVar("sv_visiblemaxplayers")
+    local max = visible and number(method(visible, "GetInt")) or 0
+    if max <= 0 and type(game.MaxPlayers) == "function" then max = number(game.MaxPlayers()) end
+    return {ok = true, source = clients and "holylib" or "stock",
+        players = math.max(clients or 0, inGame + connecting), in_game = inGame, bots = bots, max = max}
+end
+
 ---@param request table
 ---@return table
 local function startErrors(request)
@@ -384,6 +415,7 @@ return function(request, reply)
         local result
         if action == "capabilities" then result = {ok = true, capabilities = capabilities()}
         elseif action == "players" then result = players(request)
+        elseif action == "population" then result = population()
         elseif action == "errors_start" then result = startErrors(request)
         elseif action == "errors" then result = readErrors(request)
         elseif action == "errors_stop" then

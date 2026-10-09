@@ -8,6 +8,7 @@
     "port": "22"
   },
   "public_ip": "203.0.113.10",
+  "player_count_source": "holylib",
   "volroot": "/var/lib/pterodactyl/volumes",
   "backups_root": "/var/lib/pterodactyl/srcds_mcp_backups",
   "wings": {
